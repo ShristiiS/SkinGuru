@@ -1,9 +1,9 @@
-import httpx
+import json
 
 from clients.supabase import get_processed_product_ids_by_urls
-from config import PRECOMPUTE_TIMEOUT_SECONDS, PRECOMPUTE_WEBHOOK_URL
 from ingestion.catalog import PRODUCT_URLS
-from tracing import record_http, traced
+from precompute.flow1.run import accept_precompute
+from tracing import current_run_id, traced
 
 
 @traced("get_all_product_ids")
@@ -15,21 +15,9 @@ def get_all_product_ids() -> dict:
 
 @traced("call_precomputation")
 def call_precomputation(product_ids: list) -> str:
-    """Node 36 — POST {product_ids} to precompute. Plain text response, do not JSON-parse."""
-    response = httpx.post(
-        PRECOMPUTE_WEBHOOK_URL,
-        json={"product_ids": product_ids},
-        timeout=PRECOMPUTE_TIMEOUT_SECONDS,
-    )
-    record_http(
-        response.status_code,
-        url=PRECOMPUTE_WEBHOOK_URL,
-        method="POST",
-        request_body={"product_ids": product_ids},
-        response_body=response.text,
-    )
-    response.raise_for_status()
-    return response.text
+    """Node 36 — start Python pre-compute in-process. String reply, do not JSON-parse."""
+    reply = accept_precompute(product_ids, current_run_id())
+    return json.dumps(reply)
 
 
 @traced("post_loop_handoff")
