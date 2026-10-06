@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 
 from ingestion.orchestrator import run_subflow1
-from orchestrator.concern import ConcernAnalysisError
 from orchestrator.parser import NO_INGREDIENTS_MESSAGE
 from orchestrator.run import run_orchestrator
 from precompute.flow1.run import PRODUCT_IDS_ERROR, accept_precompute, parse_product_ids
@@ -35,8 +34,6 @@ async def recommendation_orchestrator(request: Request):
                         status_code=400, detail=NO_INGREDIENTS_MESSAGE
                     ) from exc
                 raise
-            except ConcernAnalysisError as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/recommendation-precompute")

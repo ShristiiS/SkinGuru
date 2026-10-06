@@ -45,6 +45,10 @@ LLM_INTER_BATCH_WAIT_SECONDS = 1
 FUNCTIONAL_CATEGORY_URL = f"{N8N_WEBHOOK_BASE}/functional-category-on-demand"
 FUNCTIONAL_CATEGORY_TIMEOUT_SECONDS = 60
 FUNCTIONAL_INTER_BATCH_WAIT_SECONDS = 20
+# Per-ingredient / concern-trigger retries in the Recommendation Orchestrator.
+# 1 initial attempt + 5 retries; 5s between attempts of the same work.
+ORCHESTRATOR_MAX_ATTEMPTS = 6
+ORCHESTRATOR_RETRY_WAIT_SECONDS = 5
 
 
 def require_supabase_config() -> tuple[str, str]:

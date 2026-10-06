@@ -6,8 +6,17 @@ from config import (
     LLM_BATCH_SIZE,
     LLM_ENRICHMENT_TIMEOUT_SECONDS,
     LLM_INTER_BATCH_WAIT_SECONDS,
+    ORCHESTRATOR_MAX_ATTEMPTS,
 )
 from orchestrator.n8n import post_n8n_webhook
+from orchestrator.retry import (
+    STEP_LLM,
+    AttemptHadFailures,
+    classify_reply,
+    record_and_collect_not_processed,
+    record_attempt,
+    wait_before_retry,
+)
 from tracing import traced
 
 logger = logging.getLogger(__name__)
@@ -49,16 +58,17 @@ def expand_to_items(batch: dict) -> list[dict]:
 
 @traced("handle_llm_errors")
 def handle_llm_errors(ingredient_name: str, batch_number: int, response) -> dict:
-    """Node 11 — error field or missing status → failed."""
-    if not isinstance(response, dict):
-        response = {}
-    if response.get("error") or not response.get("status"):
+    """Error field, missing status, or failed/error status → failed."""
+    failed, error = classify_reply(response)
+    if failed:
         return {
             "ingredient_name": ingredient_name,
             "status": "failed",
-            "error": response.get("error") or "Unknown error",
+            "error": error,
             "batch_number": batch_number,
         }
+    if not isinstance(response, dict):
+        response = {}
     return {
         "ingredient_name": ingredient_name,
         "status": response.get("status") or "completed",
@@ -98,26 +108,6 @@ def log_batch_progress(handled: list[dict]) -> dict | None:
         "failed": failed,
         "failed_ingredients": failed_ingredients,
     }
-
-
-@traced("prepare_llm_retry")
-def prepare_llm_retry(progress: dict) -> list[dict]:
-    """Node 14 — retry only if 1–3 failed; >3 skip (return [])."""
-    failed_ingredients = progress.get("failed_ingredients") or []
-    if len(failed_ingredients) > 3:
-        logger.warning(
-            "Skipping LLM retry: %s failures in batch (more than 3)",
-            len(failed_ingredients),
-        )
-        return []
-    return [
-        {
-            "ingredient_name": name,
-            "is_retry": True,
-            "retry_attempt": 1,
-        }
-        for name in failed_ingredients
-    ]
 
 
 def _response_json(response) -> dict:
@@ -160,39 +150,64 @@ async def _call_batch_parallel(names_and_batches: list[tuple[str, int]]) -> list
 
 @traced("run_llm_enrichment")
 async def run_llm_enrichment(worklist: dict) -> dict:
-    """Nodes 7–20. Sequential batches of up to 5 parallel name-only n8n calls."""
+    """Sequential batches of up to 5; retry only remaining failures, up to 6 attempts."""
     batches = prepare_llm_batches(worklist["ingredient_ids"])
     batch_summaries = []
+    leftovers = []
 
     for batch in batches:
-        expanded = expand_to_items(batch)
-        handled = await _call_batch_parallel(
-            [(item["ingredient_name"], item["batch_number"]) for item in expanded]
-        )
-        progress = log_batch_progress(handled)
+        remaining = expand_to_items(batch)
+        attempt_logs = []
+        last_error_by_name = {}
 
-        retry_items = []
-        retry_progress = None
-        if progress and progress["failed"] > 0:
-            retry_items = prepare_llm_retry(progress)
-            if retry_items:
-                retried = await _call_batch_parallel(
-                    [
-                        (item["ingredient_name"], progress["batch_number"])
-                        for item in retry_items
-                    ]
+        for attempt in range(1, ORCHESTRATOR_MAX_ATTEMPTS + 1):
+            if not remaining:
+                break
+            await wait_before_retry(attempt)
+            handled = await _call_batch_parallel(
+                [(item["ingredient_name"], item["batch_number"]) for item in remaining]
+            )
+            passed = []
+            failed = []
+            still = []
+            for item, row in zip(remaining, handled):
+                name = item["ingredient_name"]
+                if row.get("status") == "failed" or row.get("error"):
+                    error = row.get("error") or "Unknown error"
+                    failed.append({"ingredient_name": name, "error": error})
+                    last_error_by_name[name] = error
+                    still.append(item)
+                else:
+                    passed.append(name)
+            try:
+                record_attempt(
+                    STEP_LLM,
+                    attempt,
+                    sent=[item["ingredient_name"] for item in remaining],
+                    passed=passed,
+                    failed=failed,
                 )
-                retry_progress = log_batch_progress(retried)
-            else:
-                # PORT DECISION #7: zero retry items → skip Log LLM Retry.
-                retry_progress = None
+            except AttemptHadFailures:
+                pass
+            remaining = still
+            attempt_logs.append(
+                {"attempt": attempt, "passed": passed, "failed": failed}
+            )
+
+        for item in remaining:
+            name = item["ingredient_name"]
+            leftovers.append(
+                {
+                    "ingredient_name": name,
+                    "step": STEP_LLM,
+                    "error": last_error_by_name.get(name) or "Unknown error",
+                }
+            )
 
         batch_summaries.append(
             {
                 "batch_number": batch["batch_number"],
-                "progress": progress,
-                "retried": bool(retry_items),
-                "retry_progress": retry_progress,
+                "attempts": attempt_logs,
             }
         )
         # Node 18 Wait — 1s default; not specified in the n8n export.
@@ -201,4 +216,5 @@ async def run_llm_enrichment(worklist: dict) -> dict:
     return {
         "llm_total_batches": len(batches),
         "llm_batches": batch_summaries,
+        "not_processed": record_and_collect_not_processed(leftovers),
     }
