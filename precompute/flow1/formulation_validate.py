@@ -45,6 +45,11 @@ def _entries(tool_log, name: str) -> list:
     ]
 
 
+def _last_ok(entries, name: str) -> None:
+    if entries[-1].get("ok") is not True:
+        raise ValueError(f"{name} returned an error")
+
+
 def _as_int(value):
     try:
         return int(value)
@@ -83,14 +88,12 @@ def validate_formulation_agent(result, node22: dict) -> None:
         entries = _entries(tool_log, name)
         if not entries:
             raise ValueError(f"{name} not called")
-        if any(entry.get("ok") is not True for entry in entries):
-            raise ValueError(f"{name} returned an error")
+        _last_ok(entries, name)
 
     store_entries = _entries(tool_log, "store_formulation_score")
     if not store_entries:
         raise ValueError("store_formulation_score not called")
-    if any(entry.get("ok") is not True for entry in store_entries):
-        raise ValueError("store_formulation_score returned an error")
+    _last_ok(store_entries, "store_formulation_score")
 
     if max_calls_hit:
         raise ValueError("hit 10 turns")
@@ -135,18 +138,15 @@ def validate_formulation_agent(result, node22: dict) -> None:
     parsed_calc = _parse_json(calc_raw, "calculate_formulation_score result")
     if not isinstance(parsed_calc, dict):
         raise ValueError("calculate_formulation_score result is not an object")
-    breakdown = parsed_calc.get("score_breakdown")
-    if not isinstance(breakdown, dict):
-        breakdown = {}
     if parsed_store.get("formulation_score") != parsed_calc.get("final_score"):
         raise ValueError(
             f"formulation_score {parsed_store.get('formulation_score')!r} "
             f"≠ final_score {parsed_calc.get('final_score')!r}"
         )
     for name in _COMPONENTS:
-        component = breakdown.get(name)
+        component = parsed_calc.get(name)
         if not isinstance(component, dict):
-            raise ValueError(f"{name} missing from calculate score_breakdown")
+            raise ValueError(f"{name} missing from calculate result")
         score_key = f"{name}_score"
         ingredients_key = f"{name}_ingredients"
         if parsed_store.get(score_key) != component.get("score"):

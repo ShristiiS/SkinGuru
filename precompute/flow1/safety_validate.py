@@ -20,6 +20,11 @@ def _entries(tool_log, name: str) -> list:
     ]
 
 
+def _last_ok(entries, name: str) -> None:
+    if entries[-1].get("ok") is not True:
+        raise ValueError(f"{name} returned an error")
+
+
 def _empty_text(value) -> bool:
     if not isinstance(value, str):
         return True
@@ -39,14 +44,12 @@ def validate_safety_agent(result, interaction_result) -> None:
     calc_entries = _entries(tool_log, "calculate_and_store_safety_flags")
     if not calc_entries:
         raise ValueError("calculate_and_store_safety_flags not called")
-    if any(entry.get("ok") is not True for entry in calc_entries):
-        raise ValueError("calculate_and_store_safety_flags returned an error")
+    _last_ok(calc_entries, "calculate_and_store_safety_flags")
 
     store_entries = _entries(tool_log, "store_safety_flags")
     if not store_entries:
         raise ValueError("store_safety_flags not called")
-    if any(entry.get("ok") is not True for entry in store_entries):
-        raise ValueError("store_safety_flags returned an error")
+    _last_ok(store_entries, "store_safety_flags")
 
     if max_calls_hit:
         raise ValueError("hit 10 turns")

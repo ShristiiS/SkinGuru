@@ -248,6 +248,11 @@ def _entries(tool_log, name: str) -> list:
     ]
 
 
+def _last_ok(entries, name: str) -> None:
+    if entries[-1].get("ok") is not True:
+        raise ValueError(f"{name} returned an error")
+
+
 def _pair_key(left, right):
     if not left or not right:
         return None
@@ -315,12 +320,12 @@ def validate_interaction_builder_checks(parsed: dict, result) -> None:
 
     for name in _GET_TOOLS:
         entries = _entries(tool_log, name)
-        if any(entry.get("ok") is not True for entry in entries):
-            raise ValueError(f"{name} returned an error")
+        if entries:
+            _last_ok(entries, name)
 
     save_entries = _entries(tool_log, "save_llm_interaction")
-    if any(entry.get("ok") is not True for entry in save_entries):
-        raise ValueError("save_llm_interaction returned an error")
+    if save_entries:
+        _last_ok(save_entries, "save_llm_interaction")
 
     if max_calls_hit:
         raise ValueError("hit 50 turns")

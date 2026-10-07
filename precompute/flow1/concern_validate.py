@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 
-from precompute.flow1.value_equal import ingredients_equal, pairs_equal
+from precompute.flow1.value_equal import ingredients_equal
 
 _CONCERN_COUNT = 15
 _CONTRIBUTING_KEYS = (
@@ -35,6 +35,11 @@ def _entries(tool_log, name: str) -> list:
         for entry in tool_log or []
         if isinstance(entry, dict) and entry.get("name") == name
     ]
+
+
+def _last_ok(entries, name: str) -> None:
+    if entries[-1].get("ok") is not True:
+        raise ValueError(f"{name} returned an error")
 
 
 def _as_int(value):
@@ -85,20 +90,31 @@ def _contributing_format_ok(rows, label: str, concern_key) -> None:
             )
 
 
-def _synergy_pairs_format_ok(rows, concern_key) -> None:
-    if not isinstance(rows, list):
+def _synergy_pair_names(value):
+    """[] or exactly two non-empty name strings. None if the shape is wrong."""
+    if not isinstance(value, list):
+        return None
+    if len(value) == 0:
+        return []
+    if (
+        len(value) == 2
+        and all(isinstance(name, str) and name.strip() for name in value)
+    ):
+        return [name.strip() for name in value]
+    return None
+
+
+def _pair_key(names):
+    return frozenset(name.casefold() for name in names)
+
+
+def _synergy_pairs_format_ok(rows, concern_key) -> list:
+    names = _synergy_pair_names(rows)
+    if names is None:
         raise ValueError(
-            f'concern {concern_key!r} synergy_pairs is not a list'
+            f'concern {concern_key!r} synergy_pairs is not [] or two names'
         )
-    for item in rows:
-        if not (
-            isinstance(item, (list, tuple))
-            and len(item) == 2
-            and all(isinstance(name, str) and name.strip() for name in item)
-        ):
-            raise ValueError(
-                f'concern {concern_key!r} synergy_pairs item is not two names'
-            )
+    return names
 
 
 def validate_concern_agent(result, product_id, synergy) -> None:
@@ -109,14 +125,12 @@ def validate_concern_agent(result, product_id, synergy) -> None:
     calc_entries = _entries(tool_log, "calculate_concern_scores")
     if not calc_entries:
         raise ValueError("calculate_concern_scores not called")
-    if any(entry.get("ok") is not True for entry in calc_entries):
-        raise ValueError("calculate_concern_scores returned an error")
+    _last_ok(calc_entries, "calculate_concern_scores")
 
     store_entries = _entries(tool_log, "store_concern_results")
     if not store_entries:
         raise ValueError("store_concern_results not called")
-    if any(entry.get("ok") is not True for entry in store_entries):
-        raise ValueError("store_concern_results returned an error")
+    _last_ok(store_entries, "store_concern_results")
 
     first_calc = next(
         i
@@ -229,15 +243,24 @@ def validate_concern_agent(result, product_id, synergy) -> None:
                 f'concern {key!r} synergy_score {row.get("synergy_score")!r} '
                 f'≠ synergy {entry.get("score")!r}'
             )
-        if not pairs_equal(row.get("synergy_pairs"), entry.get("pairs")):
+        store_pair = _synergy_pairs_format_ok(row.get("synergy_pairs"), key)
+        synergy_pair = _synergy_pair_names(entry.get("pairs"))
+        if synergy_pair is None or _pair_key(store_pair) != _pair_key(
+            synergy_pair
+        ):
             raise ValueError(
                 f'concern {key!r} synergy_pairs ≠ synergy pairs'
             )
-        if row.get("synergy_reasoning") != entry.get("reason"):
-            raise ValueError(
-                f'concern {key!r} synergy_reasoning {row.get("synergy_reasoning")!r} '
-                f'≠ synergy {entry.get("reason")!r}'
-            )
+        if _empty_text(row.get("synergy_reasoning")):
+            raise ValueError(f'concern {key!r} synergy_reasoning empty')
+        if synergy_pair:
+            text = row.get("synergy_reasoning")
+            text_cf = text.casefold()
+            for name in synergy_pair:
+                if name.casefold() not in text_cf:
+                    raise ValueError(
+                        f'concern {key!r} synergy_reasoning missing {name!r}'
+                    )
 
     for row in parsed_store:
         key = row.get("concern_key")
@@ -260,4 +283,3 @@ def validate_concern_agent(result, product_id, synergy) -> None:
             "bonus_contributing_ingredients",
             key,
         )
-        _synergy_pairs_format_ok(row.get("synergy_pairs"), key)

@@ -27,6 +27,9 @@ from tracing.context import current_span_fields
 from tracing.debug import to_jsonable
 
 MAX_AGENT_MODEL_CALLS = 10
+FORMULATION_STORE_NUDGE = (
+    "You have not called store_formulation_score. Call it now with the JSON as instructed."
+)
 
 CONCERN_CALCULATE_DESCRIPTION = (
     "Calculates concern scores for all 15 concerns for a product. "
@@ -198,6 +201,8 @@ def run_tools_agent(
     tools: list[AgentTool],
     max_completion_tokens=None,
     max_calls=MAX_AGENT_MODEL_CALLS,
+    nudge_if_tool_missing=None,
+    nudge_missing_message=None,
 ) -> AgentRunResult:
     """n8n Tools Agent v3: up to 10 model calls; tool errors go back to the model."""
     openai_tools = _openai_tools(tools)
@@ -212,6 +217,7 @@ def run_tools_agent(
         parent_fields["agent_debug"] = agent_log
     last_text = ""
     tool_log = []
+    nudged = False
     for call_number in range(1, max_calls + 1):
         with trace_step("tools_agent_llm"):
             message = chat_completions_turn(
@@ -231,6 +237,22 @@ def run_tools_agent(
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             last_text = message.get("content") or ""
+            if (
+                nudge_if_tool_missing
+                and nudge_missing_message
+                and not nudged
+                and call_number < max_calls
+                and not any(
+                    isinstance(entry, dict)
+                    and entry.get("name") == nudge_if_tool_missing
+                    for entry in tool_log
+                )
+            ):
+                nudged = True
+                messages.append(
+                    {"role": "user", "content": nudge_missing_message}
+                )
+                continue
             agent_log["stop_reason"] = "no more tool calls"
             break
         for tool_call in tool_calls:
@@ -914,4 +936,6 @@ def run_formulation_agent(node22: dict) -> str:
         300,
         list(FORMULATION_AGENT_TOOLS),
         max_completion_tokens=32768,
+        nudge_if_tool_missing="store_formulation_score",
+        nudge_missing_message=FORMULATION_STORE_NUDGE,
     )
