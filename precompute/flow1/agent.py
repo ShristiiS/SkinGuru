@@ -36,7 +36,7 @@ CONCERN_STORE_DESCRIPTION = (
     "Stores concern scores for all 15 concerns in product_concern_scores "
     "table. Input: data as JSON string — array of 15 concern objects with "
     "product_id, concern_key, concern_score, bonus_score, concern_reasoning, "
-    "concern_contributing_ingredients, synergy_score, synergy_pairs, "
+    "concern_contributing_ingredients, bonus_contributing_ingredients, synergy_score, synergy_pairs, "
     "synergy_reasoning, bonus_reasoning, full_explanation"
 )
 
