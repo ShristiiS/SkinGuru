@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -21,6 +20,7 @@ from clients.supabase import (
     store_product_formulation_score,
     store_product_safety_flags,
 )
+from precompute.call_retry import call_with_retry
 from precompute.flow1.llm import chat_completions_turn, responses_turn
 from tracing import record_prompt_values, trace_step
 from tracing.context import current_span_fields
@@ -47,6 +47,17 @@ class AgentTool:
     description: str
     parameters: tuple
     run: Callable
+
+
+@dataclass(frozen=True)
+class AgentRunResult:
+    text: str
+    tool_log: list
+    max_calls_hit: bool
+
+
+class ToolBlock(Exception):
+    """Python blocked the tool; ok=false without parsing the result text."""
 
 
 def _openai_tools(tools: list[AgentTool]) -> list:
@@ -125,7 +136,7 @@ def _tool_error_text(exc: BaseException) -> str:
     return str(exc)
 
 
-def _run_one_tool(tool_call: dict, tools: dict[str, AgentTool]) -> str:
+def _run_one_tool(tool_call: dict, tools: dict[str, AgentTool]) -> tuple[str, bool]:
     function = tool_call.get("function") or {}
     name = function.get("name") or ""
     raw_args = function.get("arguments")
@@ -135,6 +146,7 @@ def _run_one_tool(tool_call: dict, tools: dict[str, AgentTool]) -> str:
         raw_args = json.dumps(raw_args)
 
     result = None
+    ok = False
     parsed_args = raw_args
     with trace_step(name or "unknown_tool") as fields:
         try:
@@ -143,25 +155,30 @@ def _run_one_tool(tool_call: dict, tools: dict[str, AgentTool]) -> str:
                 parsed_args = args
             except Exception as exc:
                 result = str(exc)
-                return result
+                return result, False
             if not isinstance(args, dict):
                 result = "JSON.parse of the model's string did not produce an object"
-                return result
+                return result, False
             tool = tools.get(name)
             if tool is None:
                 result = f"Unknown tool: {name}"
-                return result
+                return result, False
             for spec in tool.parameters:
                 if spec["name"] not in args:
                     if not spec.get("required", True):
                         continue
                     result = f"Required parameter '{spec['name']}' is missing"
-                    return result
+                    return result, False
             try:
                 result = tool.run(args)
+                ok = True
+            except ToolBlock as exc:
+                result = str(exc)
+                ok = False
             except Exception as exc:
                 result = _tool_error_text(exc)
-            return result
+                ok = False
+            return result, ok
         finally:
             try:
                 fields["debug_input"] = {
@@ -181,8 +198,7 @@ def run_tools_agent(
     tools: list[AgentTool],
     max_completion_tokens=None,
     max_calls=MAX_AGENT_MODEL_CALLS,
-    return_tool_log=False,
-) -> str:
+) -> AgentRunResult:
     """n8n Tools Agent v3: up to 10 model calls; tool errors go back to the model."""
     openai_tools = _openai_tools(tools)
     by_name = {tool.name: tool for tool in tools}
@@ -218,7 +234,7 @@ def run_tools_agent(
             agent_log["stop_reason"] = "no more tool calls"
             break
         for tool_call in tool_calls:
-            result = _run_one_tool(tool_call, by_name)
+            result, ok = _run_one_tool(tool_call, by_name)
             function = tool_call.get("function") or {}
             arguments = function.get("arguments")
             parsed_arguments = arguments
@@ -232,12 +248,15 @@ def run_tools_agent(
                     "name": function.get("name"),
                     "arguments": to_jsonable(parsed_arguments),
                     "result": to_jsonable(result),
+                    "ok": ok,
                 }
             )
             tool_log.append(
                 {
                     "name": function.get("name"),
-                    "observation": result,
+                    "arguments": to_jsonable(parsed_arguments),
+                    "result": result,
+                    "ok": ok,
                 }
             )
             messages.append(
@@ -249,9 +268,10 @@ def run_tools_agent(
             )
     else:
         agent_log["stop_reason"] = f"{max_calls}-call limit"
-    if return_tool_log:
-        return last_text, tool_log
-    return last_text
+    max_calls_hit = agent_log["stop_reason"] == f"{max_calls}-call limit"
+    return AgentRunResult(
+        text=last_text, tool_log=tool_log, max_calls_hit=max_calls_hit
+    )
 
 
 def run_tools_agent_responses(
@@ -262,8 +282,7 @@ def run_tools_agent_responses(
     tools: list[AgentTool],
     max_output_tokens=None,
     max_calls=MAX_AGENT_MODEL_CALLS,
-    return_tool_log=False,
-) -> str:
+) -> AgentRunResult:
     """Interaction Builder only: Responses API tool loop."""
     openai_tools = _responses_tools(tools)
     by_name = {tool.name: tool for tool in tools}
@@ -300,7 +319,7 @@ def run_tools_agent_responses(
             agent_log["stop_reason"] = "no more tool calls"
             break
         for tool_call in tool_calls:
-            result = _run_one_tool(tool_call, by_name)
+            result, ok = _run_one_tool(tool_call, by_name)
             function = tool_call.get("function") or {}
             arguments = function.get("arguments")
             parsed_arguments = arguments
@@ -314,12 +333,15 @@ def run_tools_agent_responses(
                     "name": function.get("name"),
                     "arguments": to_jsonable(parsed_arguments),
                     "result": to_jsonable(result),
+                    "ok": ok,
                 }
             )
             tool_log.append(
                 {
                     "name": function.get("name"),
-                    "observation": result,
+                    "arguments": to_jsonable(parsed_arguments),
+                    "result": result,
+                    "ok": ok,
                 }
             )
             output = result if isinstance(result, str) else str(result)
@@ -332,20 +354,21 @@ def run_tools_agent_responses(
             )
     else:
         agent_log["stop_reason"] = f"{max_calls}-call limit"
-    if return_tool_log:
-        return last_text, tool_log
-    return last_text
+    max_calls_hit = agent_log["stop_reason"] == f"{max_calls}-call limit"
+    return AgentRunResult(
+        text=last_text, tool_log=tool_log, max_calls_hit=max_calls_hit
+    )
 
 
 def _run_calculate_concern_scores(args: dict) -> str:
-    return calculate_product_concern_scores(args["product_id"])
+    return call_with_retry(calculate_product_concern_scores, args["product_id"])
 
 
 def _run_store_concern_results(args: dict) -> str:
     data = args["data"]
     if not isinstance(data, str):
-        return "Required parameter 'data' must be a string"
-    return store_product_concern_scores(data)
+        raise ToolBlock("Required parameter 'data' must be a string")
+    return call_with_retry(store_product_concern_scores, data)
 
 
 CONCERN_AGENT_TOOLS = (
@@ -492,7 +515,9 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
     state = {"calc_result": None}
 
     def run_calculate(_args: dict) -> str:
-        raw = calculate_product_safety_flags(product_id, interaction_result)
+        raw = call_with_retry(
+            calculate_product_safety_flags, product_id, interaction_result
+        )
         try:
             parsed = json.loads(raw)
         except (TypeError, json.JSONDecodeError):
@@ -504,19 +529,19 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
     def run_store(args: dict) -> str:
         calc_result = state["calc_result"]
         if not isinstance(calc_result, dict):
-            return _STORE_BEFORE_CALCULATE_ERROR
+            raise ToolBlock(_STORE_BEFORE_CALCULATE_ERROR)
         missing = [
             key for key in SAFETY_CALC_RESULT_KEYS if key not in calc_result
         ]
         if missing:
-            return (
+            raise ToolBlock(
                 "ERROR: calculate_and_store_safety_flags result is missing "
                 f"fields: {missing}"
             )
         payload = _build_safety_store_payload(
             product_id, interaction_result, calc_result, args
         )
-        return store_product_safety_flags(payload)
+        return call_with_retry(store_product_safety_flags, payload)
 
     return [
         AgentTool(
@@ -577,15 +602,18 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
 
 
 def _run_get_product_ingredients_with_functions(args: dict) -> str:
-    return get_product_ingredients_with_functions(args["product_id"])
+    return call_with_retry(
+        get_product_ingredients_with_functions, args["product_id"]
+    )
 
 
 def _run_count_botanicals(args: dict) -> str:
-    return count_botanicals(args["product_id"])
+    return call_with_retry(count_botanicals, args["product_id"])
 
 
 def _run_calculate_formulation_score(args: dict) -> str:
-    return calculate_formulation_score(
+    return call_with_retry(
+        calculate_formulation_score,
         args["product_id"],
         args["product_type"],
         args["botanical_count"],
@@ -594,7 +622,7 @@ def _run_calculate_formulation_score(args: dict) -> str:
 
 def _run_store_formulation_score(args: dict) -> str:
     parsed = _parse_model_json(args["data"])
-    return store_product_formulation_score(parsed)
+    return call_with_retry(store_product_formulation_score, parsed)
 
 
 FORMULATION_AGENT_TOOLS = (
@@ -674,26 +702,32 @@ FORMULATION_AGENT_TOOLS = (
 
 
 def _run_get_active_ingredients_for_interactions(args: dict) -> str:
-    return get_active_ingredients_for_interactions(args["product_id"])
+    return call_with_retry(
+        get_active_ingredients_for_interactions, args["product_id"]
+    )
 
 
 def _run_get_predefined_interactions_for_interaction_builder(
     args: dict,
 ) -> str:
-    return get_predefined_interactions_for_interaction_builder(
-        args["product_id"]
+    return call_with_retry(
+        get_predefined_interactions_for_interaction_builder,
+        args["product_id"],
     )
 
 
 def _run_get_ingredient_irritation_flags(args: dict) -> str:
-    return get_ingredient_irritation_flags(args["product_id"])
+    return call_with_retry(
+        get_ingredient_irritation_flags, args["product_id"]
+    )
 
 
 def _run_save_llm_interaction(args: dict) -> str:
     severity = args.get("severity")
     if severity in (None, ""):
         severity = None
-    return save_llm_interaction(
+    return call_with_retry(
+        save_llm_interaction,
         args["ingredient_a"],
         args["ingredient_b"],
         args["raw_type"],
@@ -818,29 +852,15 @@ def run_interaction_builder_agent(
     )
 
     record_prompt_values({"product_id": product_id})
-
-    def invoke():
-        return run_tools_agent_responses(
-            strip_leading_equals(INTERACTION_BUILDER_AGENT_SYSTEM),
-            render_interaction_builder_agent_user(product_id),
-            model,
-            timeout,
-            list(INTERACTION_BUILDER_AGENT_TOOLS),
-            max_output_tokens=32768,
-            max_calls=50,
-            return_tool_log=True,
-        )
-
-    try:
-        return invoke()
-    except Exception as exc:
-        with trace_step("interaction_builder_retry") as fields:
-            fields["debug_input"] = {"first_attempt_error": str(exc)}
-            fields["debug_output"] = (
-                "first attempt failed; starting second attempt after 2s"
-            )
-        time.sleep(2)
-        return invoke()
+    return run_tools_agent_responses(
+        strip_leading_equals(INTERACTION_BUILDER_AGENT_SYSTEM),
+        render_interaction_builder_agent_user(product_id),
+        model,
+        timeout,
+        list(INTERACTION_BUILDER_AGENT_TOOLS),
+        max_output_tokens=32768,
+        max_calls=50,
+    )
 
 
 def run_safety_agent(

@@ -26,9 +26,12 @@ def split_product_ids(product_ids: list) -> list:
 
 @traced("run_flow1")
 def run_flow1(product_ids: list) -> None:
-    """Node 3 — products one at a time. An error stops the rest of this list."""
+    """Node 3 — products one at a time. One product error does not stop the list."""
     for product_id in split_product_ids(product_ids):
-        process_one_product(product_id)
+        try:
+            process_one_product(product_id)
+        except Exception:
+            continue
 
 
 def _worker_loop() -> None:

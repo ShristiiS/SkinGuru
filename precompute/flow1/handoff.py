@@ -5,19 +5,32 @@ from clients.supabase import (
     get_formulation_type_from_scores,
     get_product_concern_data,
 )
+from precompute.call_retry import call_with_retry
 from precompute.flow1.agent import (
     run_concern_agent,
     run_formulation_agent,
     run_interaction_builder_agent,
     run_safety_agent,
 )
-from precompute.flow1.interaction_validate import validate_interaction_result
+from precompute.flow1.concern_validate import validate_concern_agent
+from precompute.flow1.formulation_validate import validate_formulation_agent
+from precompute.flow1.interaction_validate import (
+    validate_interaction_builder_checks,
+    validate_interaction_result,
+)
 from precompute.flow1.llm import chat_completions
+from precompute.flow1.safety_validate import validate_safety_agent
+from precompute.flow1.product_record import (
+    current_product_record,
+    record_step,
+)
 from precompute.flow1.prompts import (
     SYNERGY_REASONING_SYSTEM_EXPORT,
     render_synergy_reasoning_user,
     strip_leading_equals,
 )
+from precompute.flow1.run_until_ok import run_until_ok
+from precompute.flow1.synergy_validate import validate_synergy_reply
 from tracing import record_prompt_values, traced
 
 
@@ -41,11 +54,13 @@ def pass_through(product_id, estimator_result) -> dict:
         formulation_product_type = estimator_result["formulation_product_type"]
     else:
         formulation_product_type = _first_usable(
-            get_formulation_type_from_scores(product_id)
+            call_with_retry(get_formulation_type_from_scores, product_id)
         )
         if formulation_product_type is None:
             formulation_product_type = _first_usable(
-                get_formulation_type_from_concentrations(product_id)
+                call_with_retry(
+                    get_formulation_type_from_concentrations, product_id
+                )
             )
 
     return {
@@ -57,7 +72,7 @@ def pass_through(product_id, estimator_result) -> dict:
 @traced("get_concern_data")
 def get_concern_data(product_id):
     """Node 23 — Get Concern Data. One object, key order kept."""
-    return get_product_concern_data(product_id)
+    return call_with_retry(get_product_concern_data, product_id)
 
 
 @traced("synergy_reasoning")
@@ -71,32 +86,79 @@ def synergy_reasoning(concern_data) -> str:
             "concentrations": data.get("concentrations"),
         }
     )
-    return chat_completions(
-        strip_leading_equals(SYNERGY_REASONING_SYSTEM_EXPORT),
-        render_synergy_reasoning_user(concern_data),
-        "gpt-4o-mini",
-        180,
-    )
+    concern_keys = data.get("concern_keys") or []
+
+    def one_run():
+        text = chat_completions(
+            strip_leading_equals(SYNERGY_REASONING_SYSTEM_EXPORT),
+            render_synergy_reasoning_user(concern_data),
+            "gpt-4o-mini",
+            180,
+        )
+        parsed = validate_synergy_reply(text, concern_keys)
+        record = current_product_record()
+        if record is not None:
+            record.synergy_parsed = parsed
+        return text
+
+    text = run_until_ok(one_run, step="synergy_reasoning")
+    record_step("synergy_reasoning", "OK")
+    return text
 
 
 @traced("concern_agent")
 def concern_agent(node22: dict, node23, synergy_text: str) -> str:
     """Node 26 — Concern Agent. Final text is unused."""
-    return run_concern_agent(node22, node23, synergy_text)
+    data = node23 if isinstance(node23, dict) else {}
+    record = current_product_record()
+    synergy_obj = record.synergy_parsed if record is not None else None
+    if synergy_obj is None:
+        try:
+            synergy_obj = validate_synergy_reply(
+                synergy_text, data.get("concern_keys") or []
+            )
+        except Exception:
+            synergy_obj = {}
+
+    def one_run():
+        result = run_concern_agent(node22, node23, synergy_text)
+        validate_concern_agent(
+            result, product_id=node22["product_id"], synergy=synergy_obj
+        )
+        return result
+
+    return run_until_ok(one_run, step="concern")
 
 
 @traced("run_concern")
 def run_concern(node22: dict) -> None:
-    """Nodes 23, 24, 26."""
-    node23 = get_concern_data(node22["product_id"])
-    synergy_text = synergy_reasoning(node23)
-    concern_agent(node22, node23, synergy_text)
+    """Nodes 23, 24, 26. Concern fail does not stop IB / Safety / Formulation."""
+    try:
+        node23 = get_concern_data(node22["product_id"])
+    except Exception as exc:
+        record_step("synergy_reasoning", "SKIPPED", "get concern data failed")
+        record_step("concern", "FAILED", str(exc))
+        return
+    try:
+        synergy_text = synergy_reasoning(node23)
+        concern_agent(node22, node23, synergy_text)
+        record_step("concern", "OK")
+    except Exception as exc:
+        record_step("concern", "FAILED", str(exc))
+
 
 
 @traced("interaction_builder_agent")
 def interaction_builder_agent(product_id):
-    raw, tool_log = run_interaction_builder_agent(product_id)
-    return validate_interaction_result(raw, tool_log)
+    def one_run():
+        result = run_interaction_builder_agent(product_id)
+        parsed = validate_interaction_result(result.text, result.tool_log)
+        validate_interaction_builder_checks(parsed, result)
+        return parsed
+
+    parsed = run_until_ok(one_run, step="interaction_builder")
+    record_step("interaction_builder", "OK")
+    return parsed
 
 
 @traced("run_interaction_builder")
@@ -111,22 +173,40 @@ def run_interaction_builder(product_id) -> dict:
 @traced("safety_agent")
 def safety_agent(node22: dict, interaction_result) -> str:
     """Node 30 — Safety Agent. Final text is unused."""
-    return run_safety_agent(node22, interaction_result)
+    def one_run():
+        result = run_safety_agent(node22, interaction_result)
+        validate_safety_agent(result, interaction_result)
+        return result
+
+    return run_until_ok(one_run, step="safety")
 
 
 @traced("run_safety")
 def run_safety(node22: dict, interaction_result) -> None:
-    """Node 30."""
-    safety_agent(node22, interaction_result)
+    """Node 30. Safety fail does not stop Formulation."""
+    try:
+        safety_agent(node22, interaction_result)
+        record_step("safety", "OK")
+    except Exception as exc:
+        record_step("safety", "FAILED", str(exc))
 
 
 @traced("formulation_agent")
 def formulation_agent(node22: dict) -> str:
     """Node 36 — Formulation Agent. Final text is unused."""
-    return run_formulation_agent(node22)
+    def one_run():
+        result = run_formulation_agent(node22)
+        validate_formulation_agent(result, node22)
+        return result
+
+    return run_until_ok(one_run, step="formulation")
 
 
 @traced("run_formulation")
 def run_formulation(node22: dict) -> None:
     """Node 36. Node 42 is a no-op; the product loop continues after this."""
-    formulation_agent(node22)
+    try:
+        formulation_agent(node22)
+        record_step("formulation", "OK")
+    except Exception as exc:
+        record_step("formulation", "FAILED", str(exc))

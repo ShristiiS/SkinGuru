@@ -171,6 +171,21 @@ def _append_line_raw(path: Path, text: str) -> None:
             handle.flush()
 
 
+def write_status_block(text: str) -> None:
+    """Append the per-product status block to the summary file. Never raises."""
+    try:
+        run_id = current_run_id()
+        if not run_id:
+            logger.warning("status block write skipped: no run_id")
+            return
+        block = text if text.endswith("\n") else text + "\n"
+        if not block.startswith("\n"):
+            block = "\n" + block
+        _append_line_raw(_run_file(str(run_id)), redact_secrets(block))
+    except Exception as exc:
+        logger.warning("status block write failed: %s", redact_secrets(exc))
+
+
 def write_product_totals(latency_ms, tokens, cost_usd) -> None:
     """Append one product totals line. Never raises into the pipeline."""
     try:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import httpx
 
 from clients.supabase import (
@@ -8,15 +10,20 @@ from clients.supabase import (
     patch_ingredient_concentration,
 )
 from config import SERPAPI_TIMEOUT_SECONDS, require_serpapi_config
+from precompute.call_retry import call_with_retry
 from precompute.flow1.llm import chat_completions
+from precompute.flow1.product_record import record_not_processed, record_rerun
 from precompute.flow1.prompts import (
     EXTRACT_CONCENTRATION_SYSTEM,
     render_extract_concentration_user,
 )
-from tracing import record_http, record_prompt_values, traced
+from tracing import record_http, record_prompt_values, traced, trace_step
 
 EXTRACT_MODEL = "gpt-4o-mini"
 EXTRACT_TIMEOUT_SECONDS = 180
+EXTRACT_MAX_RUNS = 3
+_EXTRACT_PERCENT = re.compile(r"^\d+(?:\.\d+)?%$")
+_EXTRACT_RANGE = re.compile(r"^\d+(?:\.\d+)?-\d+(?:\.\d+)?%$")
 SERPAPI_QUERY_SUFFIX = " effective concentration percentage skincare cosmetic"
 _ESTIMATOR_MISSING = (
     "Couldn't get data for node 'concentration estimator trigger'"
@@ -55,7 +62,7 @@ def mask_serpapi_url(url: str) -> str:
 def fetch_concentration_status(node4: dict) -> list:
     """Node 10 — p_names are node 4 ingredient_name values, in node 4 order."""
     p_names = [item["ingredient_name"] for item in node4["ingredients"]]
-    return get_concentration_status(p_names)
+    return call_with_retry(get_concentration_status, p_names)
 
 
 @traced("prepare_loop_items")
@@ -93,26 +100,36 @@ def serpapi_search(canonical_name) -> dict:
         "&num=3"
     )
     masked = mask_serpapi_url(url)
-    try:
+
+    def _get():
         response = httpx.get(url, timeout=SERPAPI_TIMEOUT_SECONDS)
+        recorded_body = None
+        try:
+            recorded_body = response.json()
+        except Exception:
+            try:
+                recorded_body = response.text
+            except Exception:
+                recorded_body = None
+        record_http(
+            response.status_code,
+            url=masked,
+            method="GET",
+            response_body=recorded_body,
+        )
+        if response.status_code == 429 or response.status_code >= 500:
+            response.raise_for_status()
+        return response
+
+    try:
+        response = call_with_retry(_get)
     except httpx.TimeoutException:
         raise RuntimeError("SerpAPI timeout") from None
     except httpx.NetworkError:
         raise RuntimeError("SerpAPI network error") from None
-    recorded_body = None
-    try:
-        recorded_body = response.json()
-    except Exception:
-        try:
-            recorded_body = response.text
-        except Exception:
-            recorded_body = None
-    record_http(
-        response.status_code,
-        url=masked,
-        method="GET",
-        response_body=recorded_body,
-    )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        raise RuntimeError(f"SerpAPI HTTP {status}") from None
     if response.is_error:
         raise RuntimeError(f"SerpAPI HTTP {response.status_code}")
     payload = response.json()
@@ -143,6 +160,18 @@ def extract_concentration(canonical_name, serp_payload: dict) -> str:
     )
 
 
+def extract_text_is_allowed(text) -> bool:
+    concentration = text.strip() if isinstance(text, str) else ""
+    compared = concentration.rstrip(".")
+    if not compared or compared.lower() == "not specified":
+        return True
+    if _EXTRACT_PERCENT.fullmatch(compared):
+        return True
+    if _EXTRACT_RANGE.fullmatch(compared):
+        return True
+    return False
+
+
 @traced("prepare_concentration_update")
 def prepare_concentration_update(text, item: dict) -> dict:
     """Node 17 — trailing '.' stripped only for the not-specified comparison."""
@@ -165,20 +194,46 @@ def prepare_concentration_update(text, item: dict) -> dict:
 @traced("patch_not_specified")
 def patch_not_specified(ingredient_id) -> None:
     """Node 19."""
-    patch_ingredient_concentration(ingredient_id, "not specified")
+    call_with_retry(patch_ingredient_concentration, ingredient_id, "not specified")
 
 
 @traced("patch_concentration")
 def patch_concentration(ingredient_id, concentration_effective) -> None:
     """Node 20."""
-    patch_ingredient_concentration(ingredient_id, concentration_effective)
+    call_with_retry(
+        patch_ingredient_concentration, ingredient_id, concentration_effective
+    )
+
+
+def _record_ingredient_not_processed(name, reason: str) -> None:
+    record_not_processed(name, reason)
+    with trace_step("ingredient_not_processed") as fields:
+        fields["debug_input"] = {"canonical_name": name}
+        fields["debug_output"] = {"result": "NOT PROCESSED", "reason": reason}
 
 
 @traced("process_one_ingredient")
 def process_one_ingredient(item: dict) -> None:
     """Nodes 14–21 for one loop item."""
-    serp_payload = serpapi_search(item["canonical_name"])
-    text = extract_concentration(item["canonical_name"], serp_payload)
+    name = item["canonical_name"]
+    serp_payload = serpapi_search(name)
+    text = None
+    for run in range(1, EXTRACT_MAX_RUNS + 1):
+        try:
+            with trace_step("extract_run") as fields:
+                fields["debug_input"] = {"run": run, "canonical_name": name}
+                text = extract_concentration(name, serp_payload)
+                fields["debug_output"] = text
+                if not extract_text_is_allowed(text):
+                    raise ValueError("extract output invalid")
+            break
+        except ValueError as exc:
+            record_rerun("extract", run, str(exc))
+            if run == EXTRACT_MAX_RUNS:
+                _record_ingredient_not_processed(
+                    name, "extract output invalid after 3 runs"
+                )
+                return
     prepared = prepare_concentration_update(text, item)
     if prepared["skip_update"]:
         patch_not_specified(prepared["id"])
@@ -198,5 +253,12 @@ def search_concentrations(node4: dict, estimator_result) -> None:
     items = prepare_loop_items(
         to_prepare, node4["product_id"], estimator_result
     )
-    for item in items:
-        process_one_ingredient(item)
+    to_search = [item for item in items if item.get("canonical_name")]
+    if not to_search:
+        return
+    for item in to_search:
+        try:
+            process_one_ingredient(item)
+        except Exception as exc:
+            _record_ingredient_not_processed(item.get("canonical_name"), str(exc))
+            continue

@@ -49,6 +49,10 @@ FUNCTIONAL_INTER_BATCH_WAIT_SECONDS = 20
 # 1 initial attempt + 5 retries; 5s between attempts of the same work.
 ORCHESTRATOR_MAX_ATTEMPTS = 6
 ORCHESTRATOR_RETRY_WAIT_SECONDS = 5
+# Flow 1 call retry: original + 2; 5s between tries. Used by Flow 1
+# OpenAI / Supabase / SerpAPI wrappers. Not used by ingestion or Orchestrator.
+FLOW1_CALL_RETRY_ATTEMPTS = 3
+FLOW1_CALL_RETRY_WAIT_SECONDS = 5
 
 
 def require_supabase_config() -> tuple[str, str]:

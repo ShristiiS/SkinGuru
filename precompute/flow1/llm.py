@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import time
+
 import httpx
 
-from config import OPENAI_API_URL, OPENAI_RESPONSES_URL, require_openai_config
+from config import (
+    FLOW1_CALL_RETRY_WAIT_SECONDS,
+    OPENAI_API_URL,
+    OPENAI_RESPONSES_URL,
+    require_openai_config,
+)
 from tracing import record_http, record_llm_exchange, record_llm_retry, record_llm_usage
 
 _MAX_RETRIES = 2
@@ -80,6 +87,7 @@ def chat_completions_turn(
             record_llm_retry(attempt, exc)
             if not _is_retryable(exc) or attempt == attempts - 1:
                 raise
+            time.sleep(FLOW1_CALL_RETRY_WAIT_SECONDS)
     raise last_error
 
 
@@ -203,4 +211,5 @@ def responses_turn(
             record_llm_retry(attempt, exc)
             if not _is_retryable(exc) or attempt == attempts - 1:
                 raise
+            time.sleep(FLOW1_CALL_RETRY_WAIT_SECONDS)
     raise last_error

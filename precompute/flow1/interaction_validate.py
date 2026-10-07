@@ -31,10 +31,25 @@ _NOT_CALLED_IRRITATION_FLAGS = (
     "NOT_CALLED: get_ingredient_irritation_flags — required every run "
     "to build interaction_synergies correctly"
 )
+_GET_TOOLS = (
+    "get_active_ingredients_for_interactions",
+    "get_predefined_interactions",
+    "get_ingredient_irritation_flags",
+)
+_OUTPUT_ARRAYS = (
+    "interactions",
+    "irritation_interactions",
+    "interaction_synergies",
+    "irritation_synergies",
+)
 
 
 def _parse_obs(step):
-    obs = None if step is None else step.get("observation")
+    obs = None
+    if step is not None:
+        obs = step.get("result")
+        if obs is None:
+            obs = step.get("observation")
     try:
         return json.loads(obs) if isinstance(obs, str) else obs
     except Exception:
@@ -223,3 +238,136 @@ def validate_interaction_result(raw, tool_log=None) -> dict:
             ),
         }
         return parsed
+
+
+def _entries(tool_log, name: str) -> list:
+    return [
+        entry
+        for entry in tool_log or []
+        if isinstance(entry, dict) and entry.get("name") == name
+    ]
+
+
+def _pair_key(left, right):
+    if not left or not right:
+        return None
+    return frozenset((left, right))
+
+
+def _output_pair_key(pair):
+    if not isinstance(pair, dict):
+        return None
+    return _pair_key(pair.get("ingredient_a"), pair.get("ingredient_b"))
+
+
+def _name_set(raw) -> set:
+    parsed = _parse_obs({"result": raw})
+    if parsed is None:
+        return set()
+    if isinstance(parsed, list):
+        items = _flat_one(parsed)
+    else:
+        items = [parsed]
+    names = set()
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            names.add(item)
+        elif isinstance(item, dict):
+            name = item.get("ingredient_name")
+            if not name:
+                name = item.get("name")
+            if isinstance(name, str) and name.strip():
+                names.add(name)
+    return names
+
+
+def _predefined_pairs(raw) -> list:
+    parsed = _parse_obs({"result": raw})
+    if not isinstance(parsed, list):
+        return []
+    pairs = []
+    for item in _flat_one(parsed):
+        if not isinstance(item, dict):
+            continue
+        key = _pair_key(item.get("ingredient_a"), item.get("ingredient_b"))
+        if key is None:
+            key = _pair_key(
+                item.get("ingredient_name_a"), item.get("ingredient_name_b")
+            )
+        if key is not None:
+            pairs.append((key, item))
+    return pairs
+
+
+def validate_interaction_builder_checks(parsed: dict, result) -> None:
+    """D.8.1–7. Existing JSON/array checks stay in validate_interaction_result."""
+    tool_log = getattr(result, "tool_log", None) or []
+    max_calls_hit = bool(getattr(result, "max_calls_hit", False))
+
+    active_entries = _entries(
+        tool_log, "get_active_ingredients_for_interactions"
+    )
+    predefined_entries = _entries(tool_log, "get_predefined_interactions")
+    if not active_entries:
+        raise ValueError("get_active_ingredients_for_interactions not called")
+    if not predefined_entries:
+        raise ValueError("get_predefined_interactions not called")
+
+    for name in _GET_TOOLS:
+        entries = _entries(tool_log, name)
+        if any(entry.get("ok") is not True for entry in entries):
+            raise ValueError(f"{name} returned an error")
+
+    save_entries = _entries(tool_log, "save_llm_interaction")
+    if any(entry.get("ok") is not True for entry in save_entries):
+        raise ValueError("save_llm_interaction returned an error")
+
+    if max_calls_hit:
+        raise ValueError("hit 50 turns")
+
+    output_pairs = []
+    for pair in parsed.get("interactions") or []:
+        key = _output_pair_key(pair)
+        if key is not None:
+            output_pairs.append(key)
+    predefined = _predefined_pairs(predefined_entries[-1].get("result"))
+    output_set = set(output_pairs)
+    for key, item in predefined:
+        if key not in output_set:
+            names = sorted(key)
+            raise ValueError(
+                f"predefined pair {names[0]} + {names[-1]} missing"
+            )
+
+    saved = []
+    for entry in save_entries:
+        args = entry.get("arguments") or {}
+        if not isinstance(args, dict):
+            continue
+        key = _pair_key(args.get("ingredient_a"), args.get("ingredient_b"))
+        if key is not None:
+            saved.append(key)
+    saved_set = set(saved)
+    for pair in parsed.get("interactions") or []:
+        if not isinstance(pair, dict) or pair.get("source") != "llm":
+            continue
+        key = _output_pair_key(pair)
+        if key is None or key not in saved_set:
+            a = pair.get("ingredient_a")
+            b = pair.get("ingredient_b")
+            raise ValueError(f'source "llm" pair {a} + {b} was not saved')
+
+    active_names = _name_set(active_entries[-1].get("result"))
+    for field in _OUTPUT_ARRAYS:
+        rows = parsed.get(field) or []
+        if not isinstance(rows, list):
+            continue
+        for pair in rows:
+            if not isinstance(pair, dict):
+                continue
+            for key in ("ingredient_a", "ingredient_b"):
+                name = pair.get(key)
+                if name not in active_names:
+                    raise ValueError(
+                        f"{name!r} in {field} is not an active ingredient"
+                    )
