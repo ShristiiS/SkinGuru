@@ -29,63 +29,124 @@ def _reason_empty(value) -> bool:
     return value.strip() == ""
 
 
-def validate_synergy_reply(text, concern_keys) -> dict:
-    """D.7b. Raises ValueError with the failing check."""
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def collect_synergy_problems(text, concern_keys) -> tuple:
+    """Return (parsed_or_None, problem strings)."""
     keys = list(concern_keys) if isinstance(concern_keys, list) else []
+    problems = []
     cleaned = _cleanup_raw(text)
     try:
         parsed = json.loads(cleaned) if isinstance(cleaned, str) else cleaned
     except Exception:
-        raise ValueError("synergy reply is not valid JSON") from None
+        return None, ["synergy reply is not valid JSON"]
     if not isinstance(parsed, dict):
-        raise ValueError("synergy reply is not valid JSON")
+        return None, ["synergy reply is not valid JSON"]
     synergies = parsed.get("synergies")
     if "total_synergy_score" not in parsed or not isinstance(synergies, list):
-        raise ValueError(
+        problems.append(
             "synergy reply is not valid JSON "
             "{synergies:[...], total_synergy_score}"
         )
+        return parsed, problems
     total = parsed.get("total_synergy_score")
-    if not isinstance(total, (int, float)) or isinstance(total, bool):
-        raise ValueError(
+    if not _is_number(total):
+        problems.append(
             "synergy reply is not valid JSON "
             "{synergies:[...], total_synergy_score}"
         )
+
+    usable = []
+    names = []
     for entry in synergies:
         if not isinstance(entry, dict):
-            raise ValueError(
+            problems.append(
                 "synergy reply is not valid JSON "
                 "{synergies:[{concern, pairs, strength, reason, score}]}"
             )
-        missing = [key for key in _SYNERGY_ENTRY_KEYS if key not in entry]
-        if missing:
-            raise ValueError(
+            continue
+        missing_keys = [key for key in _SYNERGY_ENTRY_KEYS if key not in entry]
+        if missing_keys:
+            problems.append(
                 "synergy reply is not valid JSON "
                 "{synergies:[{concern, pairs, strength, reason, score}]}"
             )
+        if "concern" in entry:
+            names.append(entry.get("concern"))
+        if not missing_keys:
+            usable.append(entry)
 
-    names = [entry.get("concern") for entry in synergies]
-    if len(names) != len(keys) or len(set(names)) != len(names) or set(names) != set(
-        keys
-    ):
-        raise ValueError("synergy reply is not one entry per concern")
+    expected = set(keys)
+    counts = {}
+    for name in names:
+        counts[name] = counts.get(name, 0) + 1
+    missing = [key for key in keys if counts.get(key, 0) == 0]
+    extra = []
+    seen_extra = set()
+    for name in names:
+        if name not in expected and name not in seen_extra:
+            seen_extra.add(name)
+            extra.append(name)
+    duplicates = []
+    seen_dup = set()
+    for name in names:
+        if counts.get(name, 0) > 1 and name not in seen_dup:
+            seen_dup.add(name)
+            duplicates.append(name)
+    if missing:
+        problems.append("missing concerns: " + ", ".join(str(key) for key in missing))
+    if extra:
+        problems.append("extra concerns: " + ", ".join(str(key) for key in extra))
+    if len(duplicates) == 1:
+        problems.append(f"duplicate concern: {duplicates[0]}")
+    elif duplicates:
+        problems.append(
+            "duplicate concerns: " + ", ".join(str(key) for key in duplicates)
+        )
 
-    for entry in synergies:
+    for entry in usable:
         strength = entry.get("strength")
+        score = entry.get("score")
+        concern = entry.get("concern")
         if strength not in STRENGTH_SCORES:
-            raise ValueError(
-                f'concern {entry.get("concern")!r} score does not match strength'
+            problems.append(
+                f"concern {concern!r} score {score}, "
+                f"must match strength {strength!r}"
             )
-        if entry.get("score") != STRENGTH_SCORES[strength]:
-            raise ValueError(
-                f'concern {entry.get("concern")!r} score does not match strength'
+        elif score != STRENGTH_SCORES[strength]:
+            problems.append(
+                f"concern {concern!r} score {score}, "
+                f"must be {STRENGTH_SCORES[strength]} for strength {strength!r}"
             )
 
-    if total > 0.5:
-        raise ValueError("total_synergy_score > 0.5")
+    if _is_number(total) and total > 0.5:
+        problems.append(f"total_synergy_score {total} > 0.5")
 
-    for entry in synergies:
+    for entry in usable:
         if _reason_empty(entry.get("reason")):
-            raise ValueError(f'concern {entry.get("concern")!r} reason empty')
+            problems.append(f"concern {entry.get('concern')!r} reason empty")
 
+    return parsed, problems
+
+
+def format_synergy_feedback(problems, concern_keys) -> str:
+    keys = list(concern_keys) if isinstance(concern_keys, list) else []
+    lines = ["Your reply has these problems:"]
+    for problem in problems:
+        lines.append(f" - {problem}")
+    listed = ", ".join(str(key) for key in keys)
+    lines.append(
+        " Return the complete JSON again with exactly one entry for each of "
+        f"these {len(keys)} concerns: {listed}."
+    )
+    return "\n".join(lines)
+
+
+def validate_synergy_reply(text, concern_keys) -> dict:
+    """D.7b. Raises ValueError with the failing check(s)."""
+    parsed, problems = collect_synergy_problems(text, concern_keys)
+    if problems:
+        raise ValueError("\n".join(problems))
     return parsed

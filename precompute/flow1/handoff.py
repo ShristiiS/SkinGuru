@@ -18,10 +18,11 @@ from precompute.flow1.interaction_validate import (
     validate_interaction_builder_checks,
     validate_interaction_result,
 )
-from precompute.flow1.llm import chat_completions
+from precompute.flow1 import llm as flow1_llm
 from precompute.flow1.safety_validate import validate_safety_agent
 from precompute.flow1.product_record import (
     current_product_record,
+    record_rerun,
     record_step,
 )
 from precompute.flow1.prompts import (
@@ -29,9 +30,13 @@ from precompute.flow1.prompts import (
     render_synergy_reasoning_user,
     strip_leading_equals,
 )
-from precompute.flow1.run_until_ok import run_until_ok
-from precompute.flow1.synergy_validate import validate_synergy_reply
-from tracing import record_prompt_values, traced
+from precompute.flow1.run_until_ok import AGENT_MAX_RUNS, run_until_ok
+from precompute.flow1.synergy_validate import (
+    collect_synergy_problems,
+    format_synergy_feedback,
+    validate_synergy_reply,
+)
+from tracing import record_prompt_values, traced, trace_step
 
 
 def _usable(value) -> bool:
@@ -87,23 +92,56 @@ def synergy_reasoning(concern_data) -> str:
         }
     )
     concern_keys = data.get("concern_keys") or []
-
-    def one_run():
-        text = chat_completions(
-            strip_leading_equals(SYNERGY_REASONING_SYSTEM_EXPORT),
-            render_synergy_reasoning_user(concern_data),
-            "gpt-4o-mini",
-            180,
-        )
-        parsed = validate_synergy_reply(text, concern_keys)
-        record = current_product_record()
-        if record is not None:
-            record.synergy_parsed = parsed
-        return text
-
-    text = run_until_ok(one_run, step="synergy_reasoning")
-    record_step("synergy_reasoning", "OK")
-    return text
+    system = strip_leading_equals(SYNERGY_REASONING_SYSTEM_EXPORT)
+    user = render_synergy_reasoning_user(concern_data)
+    previous_text = None
+    feedback = None
+    last_error: BaseException | None = None
+    for run in range(1, AGENT_MAX_RUNS + 1):
+        try:
+            with trace_step("synergy_reasoning_run") as fields:
+                fields["debug_input"] = {"run": run}
+                if feedback:
+                    fields["debug_input"]["problems"] = feedback
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+                if previous_text is not None and feedback is not None:
+                    messages.append(
+                        {"role": "assistant", "content": previous_text}
+                    )
+                    messages.append({"role": "user", "content": feedback})
+                message = flow1_llm.chat_completions_turn(
+                    messages, "gpt-4o-mini", 180
+                )
+                text = message.get("content") or ""
+                previous_text = text
+                parsed, problems = collect_synergy_problems(text, concern_keys)
+                fields["debug_output"] = {
+                    "text": text,
+                    "problems": problems,
+                }
+                if problems:
+                    feedback = format_synergy_feedback(problems, concern_keys)
+                    fields["debug_output"]["feedback"] = feedback
+                    raise ValueError("\n".join(problems))
+                record = current_product_record()
+                if record is not None:
+                    record.synergy_parsed = parsed
+                record_step("synergy_reasoning", "OK")
+                return text
+        except Exception as exc:
+            last_error = exc
+            record_rerun("synergy_reasoning", run, str(exc))
+            if run == AGENT_MAX_RUNS:
+                record_step(
+                    "synergy_reasoning",
+                    "FAILED",
+                    f"run {run} of {AGENT_MAX_RUNS}: {exc}",
+                )
+                raise
+    raise last_error
 
 
 @traced("concern_agent")
@@ -121,7 +159,9 @@ def concern_agent(node22: dict, node23, synergy_text: str) -> str:
             synergy_obj = {}
 
     def one_run():
-        result = run_concern_agent(node22, node23, synergy_text)
+        result = run_concern_agent(
+            node22, node23, synergy_text, synergy=synergy_obj
+        )
         validate_concern_agent(
             result, product_id=node22["product_id"], synergy=synergy_obj
         )

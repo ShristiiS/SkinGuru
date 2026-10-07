@@ -203,6 +203,7 @@ def run_tools_agent(
     max_calls=MAX_AGENT_MODEL_CALLS,
     nudge_if_tool_missing=None,
     nudge_missing_message=None,
+    tool_log=None,
 ) -> AgentRunResult:
     """n8n Tools Agent v3: up to 10 model calls; tool errors go back to the model."""
     openai_tools = _openai_tools(tools)
@@ -216,7 +217,8 @@ def run_tools_agent(
     if parent_fields is not None:
         parent_fields["agent_debug"] = agent_log
     last_text = ""
-    tool_log = []
+    if tool_log is None:
+        tool_log = []
     nudged = False
     for call_number in range(1, max_calls + 1):
         with trace_step("tools_agent_llm"):
@@ -393,35 +395,50 @@ def _run_store_concern_results(args: dict) -> str:
     return call_with_retry(store_product_concern_scores, data)
 
 
-CONCERN_AGENT_TOOLS = (
-    AgentTool(
-        name="calculate_concern_scores",
-        description=CONCERN_CALCULATE_DESCRIPTION,
-        parameters=(
-            {
-                "name": "product_id",
-                "type": "number",
-                "description": "0",
-            },
+def concern_agent_tools(tool_log, product_id, synergy):
+    from precompute.flow1.concern_validate import concern_store_precheck
+
+    def store(args: dict) -> str:
+        data = args["data"]
+        if not isinstance(data, str):
+            raise ToolBlock("Required parameter 'data' must be a string")
+        blocked = concern_store_precheck(data, tool_log, product_id, synergy)
+        if blocked:
+            raise ToolBlock(blocked)
+        return call_with_retry(store_product_concern_scores, data)
+
+    return (
+        AgentTool(
+            name="calculate_concern_scores",
+            description=CONCERN_CALCULATE_DESCRIPTION,
+            parameters=(
+                {
+                    "name": "product_id",
+                    "type": "number",
+                    "description": "0",
+                },
+            ),
+            run=_run_calculate_concern_scores,
         ),
-        run=_run_calculate_concern_scores,
-    ),
-    AgentTool(
-        name="store_concern_results",
-        description=CONCERN_STORE_DESCRIPTION,
-        parameters=(
-            {
-                "name": "data",
-                "type": "string",
-                "description": "[]",
-            },
+        AgentTool(
+            name="store_concern_results",
+            description=CONCERN_STORE_DESCRIPTION,
+            parameters=(
+                {
+                    "name": "data",
+                    "type": "string",
+                    "description": "[]",
+                },
+            ),
+            run=store,
         ),
-        run=_run_store_concern_results,
-    ),
-)
+    )
 
 
-def run_concern_agent(node22: dict, node23, synergy_text: str) -> str:
+CONCERN_AGENT_TOOLS = concern_agent_tools([], None, None)
+
+
+def run_concern_agent(node22: dict, node23, synergy_text: str, synergy=None) -> str:
     from precompute.flow1.prompts import (
         CONCERN_AGENT_SYSTEM,
         render_concern_agent_user,
@@ -439,13 +456,15 @@ def run_concern_agent(node22: dict, node23, synergy_text: str) -> str:
             "synergy_text": synergy_text,
         }
     )
+    tool_log = []
     return run_tools_agent(
         system,
         user,
         "gpt-5.4-mini",
         600,
-        list(CONCERN_AGENT_TOOLS),
+        list(concern_agent_tools(tool_log, node22["product_id"], synergy)),
         max_completion_tokens=32768,
+        tool_log=tool_log,
     )
 
 
@@ -647,80 +666,94 @@ def _run_store_formulation_score(args: dict) -> str:
     return call_with_retry(store_product_formulation_score, parsed)
 
 
-FORMULATION_AGENT_TOOLS = (
-    AgentTool(
-        name="get_product_ingredients_with_functions",
-        description=(
-            "Fetches all ingredients with their function categories for a "
-            "product. Input: product_id (number)"
+def formulation_agent_tools(tool_log, node22):
+    from precompute.flow1.formulation_validate import formulation_store_precheck
+
+    def store(args: dict) -> str:
+        data = args["data"]
+        blocked = formulation_store_precheck(data, tool_log, node22)
+        if blocked:
+            raise ToolBlock(blocked)
+        parsed = _parse_model_json(data)
+        return call_with_retry(store_product_formulation_score, parsed)
+
+    return (
+        AgentTool(
+            name="get_product_ingredients_with_functions",
+            description=(
+                "Fetches all ingredients with their function categories for a "
+                "product. Input: product_id (number)"
+            ),
+            parameters=(
+                {
+                    "name": "product_id",
+                    "type": "number",
+                    "description": "0",
+                },
+            ),
+            run=_run_get_product_ingredients_with_functions,
         ),
-        parameters=(
-            {
-                "name": "product_id",
-                "type": "number",
-                "description": "0",
-            },
+        AgentTool(
+            name="count_botanicals",
+            description=(
+                "Counts botanical ingredients in a product. Input: product_id "
+                "(number)"
+            ),
+            parameters=(
+                {
+                    "name": "product_id",
+                    "type": "number",
+                    "description": "0",
+                },
+            ),
+            run=_run_count_botanicals,
         ),
-        run=_run_get_product_ingredients_with_functions,
-    ),
-    AgentTool(
-        name="count_botanicals",
-        description=(
-            "Counts botanical ingredients in a product. Input: product_id "
-            "(number)"
+        AgentTool(
+            name="calculate_formulation_score",
+            description=(
+                "Calculates formulation score across 4 components. Input: "
+                "product_id (number), product_type (string), botanical_count "
+                "(number)"
+            ),
+            parameters=(
+                {
+                    "name": "product_id",
+                    "type": "number",
+                    "description": "0",
+                },
+                {
+                    "name": "product_type",
+                    "type": "string",
+                    "description": "",
+                },
+                {
+                    "name": "botanical_count",
+                    "type": "number",
+                    "description": "0",
+                },
+            ),
+            run=_run_calculate_formulation_score,
         ),
-        parameters=(
-            {
-                "name": "product_id",
-                "type": "number",
-                "description": "0",
-            },
+        AgentTool(
+            name="store_formulation_score",
+            description=(
+                "Stores formulation score. Input: data as a valid JSON string. "
+                "IMPORTANT: escape all double quotes inside string values, no "
+                "trailing commas, no comments. Validate JSON before passing."
+            ),
+            parameters=(
+                {
+                    "name": "data",
+                    "type": "string",
+                    "description": "{}",
+                },
+            ),
+            run=store,
         ),
-        run=_run_count_botanicals,
-    ),
-    AgentTool(
-        name="calculate_formulation_score",
-        description=(
-            "Calculates formulation score across 4 components. Input: "
-            "product_id (number), product_type (string), botanical_count "
-            "(number)"
-        ),
-        parameters=(
-            {
-                "name": "product_id",
-                "type": "number",
-                "description": "0",
-            },
-            {
-                "name": "product_type",
-                "type": "string",
-                "description": "",
-            },
-            {
-                "name": "botanical_count",
-                "type": "number",
-                "description": "0",
-            },
-        ),
-        run=_run_calculate_formulation_score,
-    ),
-    AgentTool(
-        name="store_formulation_score",
-        description=(
-            "Stores formulation score. Input: data as a valid JSON string. "
-            "IMPORTANT: escape all double quotes inside string values, no "
-            "trailing commas, no comments. Validate JSON before passing."
-        ),
-        parameters=(
-            {
-                "name": "data",
-                "type": "string",
-                "description": "{}",
-            },
-        ),
-        run=_run_store_formulation_score,
-    ),
-)
+    )
+
+
+FORMULATION_AGENT_TOOLS = formulation_agent_tools([], {})
 
 
 def _run_get_active_ingredients_for_interactions(args: dict) -> str:
@@ -926,6 +959,7 @@ def run_formulation_agent(node22: dict) -> str:
             "formulation_product_type": node22.get("formulation_product_type"),
         }
     )
+    tool_log = []
     return run_tools_agent(
         strip_leading_equals(FORMULATION_AGENT_SYSTEM),
         render_formulation_agent_user(
@@ -934,8 +968,9 @@ def run_formulation_agent(node22: dict) -> str:
         ),
         "gpt-5.4-nano",
         300,
-        list(FORMULATION_AGENT_TOOLS),
+        list(formulation_agent_tools(tool_log, node22)),
         max_completion_tokens=32768,
         nudge_if_tool_missing="store_formulation_score",
         nudge_missing_message=FORMULATION_STORE_NUDGE,
+        tool_log=tool_log,
     )
