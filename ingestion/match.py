@@ -2,7 +2,9 @@ import logging
 import re
 
 from clients.supabase import insert_new_ingredient, match_ingredients
-from tracing import traced
+from ingestion.product_record import record_not_processed
+from precompute.call_retry import call_with_retry
+from tracing import trace_step, traced
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +15,7 @@ logger = logging.getLogger(__name__)
 # Node 20 now strips the same punctuation before building canonical_name so
 # the node 22 join always succeeds. Nodes 22's comparison is unchanged.
 _LABEL_PUNCT = re.compile(r"[.,;!]")
+JOIN_MISS_REASON = "new ingredient id not matched"
 
 
 def _strip_label_punctuation(value: str) -> str:
@@ -36,7 +39,7 @@ def prepare_batch_match(items: list[dict]) -> dict:
 @traced("find_matching_ingredients")
 def find_matching_ingredients(unique_names: list[str]) -> list[dict]:
     """Node 17 — call match_ingredients RPC; do not reimplement matching."""
-    return match_ingredients(unique_names)
+    return call_with_retry(match_ingredients, unique_names)
 
 
 @traced("map_ingredient_matches")
@@ -109,14 +112,34 @@ def insert_unmatched_ingredients(unmatched: list[dict]) -> list[dict]:
     """Node 21 — one upsert POST per unmatched item (n8n item-looping)."""
     inserted = []
     for item in unmatched:
-        inserted.append(insert_new_ingredient(prepare_new_ingredient(item)))
+        inserted.append(
+            call_with_retry(insert_new_ingredient, prepare_new_ingredient(item))
+        )
     return inserted
 
 
+def _record_join_miss(name) -> dict:
+    item = {"name": name, "reason": JOIN_MISS_REASON}
+    record_not_processed(name, JOIN_MISS_REASON)
+    with trace_step("ingredient_not_processed") as fields:
+        fields["debug_input"] = {"canonical_name": name}
+        fields["debug_output"] = {
+            "result": "NOT PROCESSED",
+            "reason": JOIN_MISS_REASON,
+        }
+    return item
+
+
 @traced("map_new_ingredient_id")
-def map_new_ingredient_id(inserted_rows: list[dict], mapped_items: list[dict]) -> list[dict]:
-    """Node 22 — join each new row back to Map Ingredient Matches; log+drop if none."""
+def map_new_ingredient_id(
+    inserted_rows: list[dict], mapped_items: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Node 22 — join each new row back to Map Ingredient Matches.
+
+    Join miss is NOT PROCESSED (not a silent drop); the rest still merge.
+    """
     remapped = []
+    not_processed = []
     for new_ing in inserted_rows:
         canonical = (new_ing.get("canonical_name") or "").upper().strip()
         orig = None
@@ -130,6 +153,7 @@ def map_new_ingredient_id(inserted_rows: list[dict], mapped_items: list[dict]) -
                 "No original ingredient found for canonical_name=%r",
                 new_ing.get("canonical_name"),
             )
+            not_processed.append(_record_join_miss(new_ing.get("canonical_name")))
             continue
         remapped.append(
             {
@@ -139,7 +163,7 @@ def map_new_ingredient_id(inserted_rows: list[dict], mapped_items: list[dict]) -
                 "matched": True,
             }
         )
-    return remapped
+    return remapped, not_processed
 
 
 @traced("merge_matched_and_new")
@@ -156,7 +180,9 @@ def match_and_upsert_ingredients(aliased_items: list[dict]) -> dict:
     mapped = map_ingredient_matches(batch["all_ingredients"], rpc_rows)
     matched, unmatched = split_matched_unmatched(mapped)
     inserted_rows = insert_unmatched_ingredients(unmatched)
-    newly_inserted = map_new_ingredient_id(inserted_rows, mapped)
+    newly_inserted, join_not_processed = map_new_ingredient_id(
+        inserted_rows, mapped
+    )
     merged = merge_matched_and_new(matched, newly_inserted)
     return {
         "total_ingredients": batch["total_ingredients"],
@@ -167,5 +193,6 @@ def match_and_upsert_ingredients(aliased_items: list[dict]) -> dict:
         "inserted_count": len(inserted_rows),
         "joined_new_count": len(newly_inserted),
         "dropped_join_count": len(inserted_rows) - len(newly_inserted),
+        "not_processed": join_not_processed,
         "merged": merged,
     }

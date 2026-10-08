@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,6 +7,8 @@ from clients.supabase import (
     insert_product,
     update_product_by_nykaa_url,
 )
+from config import FLOW1_CALL_RETRY_ATTEMPTS, FLOW1_CALL_RETRY_WAIT_SECONDS
+from precompute.call_retry import call_with_retry, is_retryable_call
 from tracing import traced
 
 # Nodes 10–11 write these 9 fields; Insert also writes nykaa_url.
@@ -63,26 +66,53 @@ def _write_fields(parsed: dict) -> dict:
     return {field: parsed.get(field) for field in _PRODUCT_WRITE_FIELDS}
 
 
+def _require_product_row(row, action: str) -> dict:
+    if not isinstance(row, dict) or row.get("id") is None:
+        raise RuntimeError(f"{action} product returned empty")
+    return row
+
+
+def _insert_product_with_retry(fields: dict) -> list[dict]:
+    """Insert with call retry; re-GET by nykaa_url before a retry and use the row if it exists."""
+    nykaa_url = fields["nykaa_url"]
+    last_error: BaseException | None = None
+    attempts = FLOW1_CALL_RETRY_ATTEMPTS
+    for attempt in range(attempts):
+        try:
+            return insert_product(fields)
+        except Exception as exc:
+            last_error = exc
+            if not is_retryable_call(exc) or attempt == attempts - 1:
+                raise
+            existing = call_with_retry(get_product_row_by_nykaa_url, nykaa_url)
+            if existing:
+                return [existing]
+            time.sleep(FLOW1_CALL_RETRY_WAIT_SECONDS)
+    raise last_error
+
+
 @traced("upsert_parsed_product")
 def upsert_parsed_product(parsed: dict) -> ProductWriteResult:
     """Nodes 8–11: CHECK PRODUCT EXISTS → Update or Insert."""
-    existing = get_product_row_by_nykaa_url(parsed["nykaa_url"])
+    existing = call_with_retry(get_product_row_by_nykaa_url, parsed["nykaa_url"])
 
     # Node 9 — PRODUCT EXISTS?  Object.keys($json).length > 0
     if len(existing.keys()) > 0:
-        updated_rows = update_product_by_nykaa_url(
+        updated_rows = call_with_retry(
+            update_product_by_nykaa_url,
             parsed["nykaa_url"],
             _write_fields(parsed),
         )
+        update_row = updated_rows[0] if updated_rows else None
         return ProductWriteResult(
             action="updated",
             insert_executed=False,
             check_product_exists=existing,
             insert_product=None,
-            update_product=updated_rows[0] if updated_rows else None,
+            update_product=_require_product_row(update_row, "update"),
         )
 
-    inserted_rows = insert_product(
+    inserted_rows = _insert_product_with_retry(
         {**_write_fields(parsed), "nykaa_url": parsed["nykaa_url"]}
     )
     insert_row = inserted_rows[0] if inserted_rows else None
@@ -90,6 +120,6 @@ def upsert_parsed_product(parsed: dict) -> ProductWriteResult:
         action="inserted",
         insert_executed=True,
         check_product_exists=existing,
-        insert_product=insert_row,
+        insert_product=_require_product_row(insert_row, "insert"),
         update_product=None,
     )

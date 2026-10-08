@@ -1,4 +1,5 @@
 from clients.supabase import get_products_by_nykaa_url
+from precompute.call_retry import call_with_retry
 from tracing import traced
 
 
@@ -8,6 +9,6 @@ def check_if_already_processed(url: str) -> dict:
 
     already_processed is true only when a row exists AND catalog_processed === true.
     """
-    result = get_products_by_nykaa_url(url)
+    result = call_with_retry(get_products_by_nykaa_url, url)
     already_processed = len(result) > 0 and result[0].get("catalog_processed") is True
     return {"url": url, "already_processed": already_processed}
