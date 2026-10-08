@@ -8,6 +8,7 @@ from config import (
     LLM_INTER_BATCH_WAIT_SECONDS,
     ORCHESTRATOR_MAX_ATTEMPTS,
 )
+from orchestrator.enrichment_status import verify_and_resend
 from orchestrator.n8n import post_n8n_webhook
 from orchestrator.retry import (
     STEP_LLM,
@@ -148,12 +149,19 @@ async def _call_batch_parallel(names_and_batches: list[tuple[str, int]]) -> list
     ]
 
 
+async def _resend_llm(chunk: list[dict]) -> list[dict]:
+    return await _call_batch_parallel([(item["name"], 1) for item in chunk])
+
+
 @traced("run_llm_enrichment")
 async def run_llm_enrichment(worklist: dict) -> dict:
     """Sequential batches of up to 5; retry only remaining failures, up to 6 attempts."""
-    batches = prepare_llm_batches(worklist["ingredient_ids"])
+    ingredient_ids = worklist["ingredient_ids"]
+    batches = prepare_llm_batches(ingredient_ids)
     batch_summaries = []
     leftovers = []
+    attempts_used = {item["name"]: 0 for item in ingredient_ids}
+    n8n_failed_names = set()
 
     for batch in batches:
         remaining = expand_to_items(batch)
@@ -172,6 +180,7 @@ async def run_llm_enrichment(worklist: dict) -> dict:
             still = []
             for item, row in zip(remaining, handled):
                 name = item["ingredient_name"]
+                attempts_used[name] = attempts_used.get(name, 0) + 1
                 if row.get("status") == "failed" or row.get("error"):
                     error = row.get("error") or "Unknown error"
                     failed.append({"ingredient_name": name, "error": error})
@@ -196,6 +205,7 @@ async def run_llm_enrichment(worklist: dict) -> dict:
 
         for item in remaining:
             name = item["ingredient_name"]
+            n8n_failed_names.add(name)
             leftovers.append(
                 {
                     "ingredient_name": name,
@@ -212,6 +222,17 @@ async def run_llm_enrichment(worklist: dict) -> dict:
         )
         # Node 18 Wait — 1s default; not specified in the n8n export.
         await asyncio.sleep(LLM_INTER_BATCH_WAIT_SECONDS)
+
+    leftovers.extend(
+        await verify_and_resend(
+            items=ingredient_ids,
+            attempts_used=attempts_used,
+            n8n_failed_names=n8n_failed_names,
+            flag="llm_enriched",
+            step=STEP_LLM,
+            resend=_resend_llm,
+        )
+    )
 
     return {
         "llm_total_batches": len(batches),

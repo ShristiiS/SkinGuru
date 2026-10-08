@@ -1,15 +1,17 @@
 import asyncio
 import logging
 
-from clients.supabase import mark_concerns_analyzed
+from clients.supabase import check_enrichment_status, mark_concerns_analyzed
 from config import (
     CONCERN_ANALYSIS_TIMEOUT_SECONDS,
     CONCERN_ANALYSIS_WAIT_SECONDS,
     ORCHESTRATOR_MAX_ATTEMPTS,
 )
+from orchestrator.enrichment_status import items_missing_flag, supabase_call_retry
 from orchestrator.n8n import post_n8n_webhook
 from orchestrator.retry import (
     STEP_CONCERN,
+    STEP_MARK,
     AttemptHadFailures,
     classify_reply,
     record_and_collect_not_processed,
@@ -21,6 +23,44 @@ from tracing import traced
 logger = logging.getLogger(__name__)
 
 CONCERN_PATH = "concern-analysis-on-demand"
+REASON_MARK_NOT_SAVED = "concern mark not saved in Supabase"
+
+
+def _mark_leftovers(items: list[dict], error: str) -> list[dict]:
+    return [
+        {
+            "ingredient_name": item["name"],
+            "step": STEP_MARK,
+            "error": error,
+        }
+        for item in items
+    ]
+
+
+async def _mark_and_verify(ingredient_ids: list[dict]) -> tuple[bool, list[dict]]:
+    """Mark → verify → re-mark still-false names → verify. Each HTTP has call_with_retry."""
+    pending = list(ingredient_ids)
+    all_ids = [item["id"] for item in ingredient_ids]
+    try:
+        await supabase_call_retry(
+            mark_concerns_analyzed,
+            [item["name"] for item in pending],
+        )
+        rows = await supabase_call_retry(check_enrichment_status, all_ids)
+        pending = items_missing_flag(ingredient_ids, rows, "concerns_processed")
+        if pending:
+            await supabase_call_retry(
+                mark_concerns_analyzed,
+                [item["name"] for item in pending],
+            )
+            rows = await supabase_call_retry(check_enrichment_status, all_ids)
+            pending = items_missing_flag(ingredient_ids, rows, "concerns_processed")
+        if not pending:
+            return True, []
+        return False, _mark_leftovers(pending, REASON_MARK_NOT_SAVED)
+    except Exception as exc:
+        logger.warning("Mark Concerns Analyzed failed: %s", exc)
+        return False, _mark_leftovers(pending, str(exc))
 
 
 def _trigger_body(ingredient_ids: list[dict]) -> list[dict]:
@@ -112,16 +152,11 @@ async def run_concern_analysis(worklist: dict) -> dict:
             "not_processed": record_and_collect_not_processed(leftovers),
         }
 
-    marked = True
-    try:
-        await asyncio.to_thread(mark_concerns_analyzed, names)
-    except Exception as exc:
-        marked = False
-        logger.warning("Mark Concerns Analyzed failed: %s", exc)
-
+    marked, leftovers = await _mark_and_verify(ingredient_ids)
+    not_processed = record_and_collect_not_processed(leftovers)
     await asyncio.sleep(CONCERN_ANALYSIS_WAIT_SECONDS)
     return {
         "concern_triggered": True,
         "concerns_marked": marked,
-        "not_processed": [],
+        "not_processed": not_processed,
     }

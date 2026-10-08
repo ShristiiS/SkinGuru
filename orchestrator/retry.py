@@ -6,6 +6,7 @@ from tracing import trace_step
 STEP_LLM = "llm_enrichment"
 STEP_FUNCTIONAL = "functional_category"
 STEP_CONCERN = "concern_analysis"
+STEP_MARK = "mark_concerns"
 
 ATTEMPT_STEP = {
     STEP_LLM: "llm_enrichment_attempt",

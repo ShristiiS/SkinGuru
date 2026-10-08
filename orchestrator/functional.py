@@ -5,6 +5,7 @@ from config import (
     FUNCTIONAL_INTER_BATCH_WAIT_SECONDS,
     ORCHESTRATOR_MAX_ATTEMPTS,
 )
+from orchestrator.enrichment_status import verify_and_resend
 from orchestrator.llm import prepare_llm_batches
 from orchestrator.n8n import post_n8n_webhook
 from orchestrator.retry import (
@@ -142,6 +143,17 @@ async def _call_retry_parallel(retry_items: list[dict], batch_number: int) -> li
     ]
 
 
+async def _resend_functional(chunk: list[dict]) -> list[dict]:
+    retry_items = [
+        {
+            "ingredient_id": item["id"],
+            "ingredient_name": item["name"],
+        }
+        for item in chunk
+    ]
+    return await _call_retry_parallel(retry_items, 1)
+
+
 @traced("run_functional_category")
 async def run_functional_category(parsed_items: list[dict]) -> dict:
     """Batches of 5; retry only remaining failures, up to 6 attempts."""
@@ -150,6 +162,8 @@ async def run_functional_category(parsed_items: list[dict]) -> dict:
     batches = prepare_llm_batches(all_ids)
     batch_summaries = []
     leftovers = []
+    attempts_used = {item["name"]: 0 for item in all_ids}
+    n8n_failed_names = set()
 
     for batch in batches:
         remaining = expand_functional_items(batch)
@@ -171,6 +185,7 @@ async def run_functional_category(parsed_items: list[dict]) -> dict:
             still = []
             for item, row in zip(remaining, handled):
                 name = item["ingredient_name"]
+                attempts_used[name] = attempts_used.get(name, 0) + 1
                 if row.get("status") == "failed" or row.get("error"):
                     error = row.get("error") or "Unknown error"
                     failed.append({"ingredient_name": name, "error": error})
@@ -195,6 +210,7 @@ async def run_functional_category(parsed_items: list[dict]) -> dict:
 
         for item in remaining:
             name = item["ingredient_name"]
+            n8n_failed_names.add(name)
             leftovers.append(
                 {
                     "ingredient_name": name,
@@ -210,6 +226,17 @@ async def run_functional_category(parsed_items: list[dict]) -> dict:
             }
         )
         await asyncio.sleep(FUNCTIONAL_INTER_BATCH_WAIT_SECONDS)
+
+    leftovers.extend(
+        await verify_and_resend(
+            items=all_ids,
+            attempts_used=attempts_used,
+            n8n_failed_names=n8n_failed_names,
+            flag="functional_processed",
+            step=STEP_FUNCTIONAL,
+            resend=_resend_functional,
+        )
+    )
 
     return {
         "functional_total_batches": len(batches),
