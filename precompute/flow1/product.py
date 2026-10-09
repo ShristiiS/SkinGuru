@@ -10,7 +10,9 @@ from precompute.flow1.estimate_store import (
     store_approx_concentrations,
     store_formulation_type,
 )
+from precompute.concentration.llm_checks import is_valid_product_type
 from precompute.flow1.handoff import (
+    NO_VALID_PRODUCT_TYPE,
     pass_through,
     run_concern,
     run_formulation,
@@ -98,7 +100,11 @@ def process_one_product(product_id) -> dict:
             except Exception as exc:
                 record_step("serpapi", "FAILED", str(exc))
             try:
-                node22 = pass_through(node4["product_id"], estimator_result)
+                node22 = pass_through(
+                    node4["product_id"],
+                    estimator_result,
+                    node4["ingredients"],
+                )
             except Exception as exc:
                 skip_from("synergy_reasoning", str(exc))
                 return {"product_id": product_id}
@@ -112,7 +118,10 @@ def process_one_product(product_id) -> dict:
                 record_step("safety", "SKIPPED", "interaction builder failed")
             if ib_result is not None:
                 run_safety(node22, ib_result)
-            run_formulation(node22)
+            if is_valid_product_type(node22.get("formulation_product_type")):
+                run_formulation(node22)
+            else:
+                record_step("formulation", "FAILED", NO_VALID_PRODUCT_TYPE)
             return node22
         finally:
             record = current_product_record()

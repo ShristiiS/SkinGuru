@@ -11,12 +11,12 @@ from clients.supabase import (
 )
 from config import SERPAPI_TIMEOUT_SECONDS, require_serpapi_config
 from precompute.call_retry import call_with_retry
-from precompute.flow1.llm import chat_completions
 from precompute.flow1.product_record import record_not_processed, record_rerun
 from precompute.flow1.prompts import (
     EXTRACT_CONCENTRATION_SYSTEM,
     render_extract_concentration_user,
 )
+from precompute.llm_call import run_llm_call
 from tracing import record_http, record_prompt_values, traced, trace_step
 
 EXTRACT_MODEL = "gpt-4o-mini"
@@ -138,6 +138,36 @@ def serpapi_search(canonical_name) -> dict:
     return payload
 
 
+def extract_text_is_allowed(text) -> bool:
+    concentration = text.strip() if isinstance(text, str) else ""
+    compared = concentration.rstrip(".")
+    if not compared or compared.lower() == "not specified":
+        return True
+    if _EXTRACT_PERCENT.fullmatch(compared):
+        return True
+    if _EXTRACT_RANGE.fullmatch(compared):
+        return True
+    return False
+
+
+def extract_output_problem(text) -> str:
+    shown = text if isinstance(text, str) else ""
+    return (
+        f"Your reply was: '{shown}'. Allowed replies: empty, 'not specified', "
+        "a single value like '5%', or a range like '0.1-2%' using a plain hyphen."
+    )
+
+
+def _extract_check(text: str):
+    if not extract_text_is_allowed(text):
+        return [extract_output_problem(text)]
+    return []
+
+
+def _record_extract_quality(run, problems) -> None:
+    record_rerun("extract", run, "\n".join(problems))
+
+
 @traced("extract_concentration")
 def extract_concentration(canonical_name, serp_payload: dict) -> str:
     """Node 15 — Extract Concentration. gpt-4o-mini, no temperature, no max tokens."""
@@ -152,24 +182,24 @@ def extract_concentration(canonical_name, serp_payload: dict) -> str:
     record_prompt_values(
         {"canonical_name": canonical_name, "search_snippets": snippets}
     )
-    return chat_completions(
-        EXTRACT_CONCENTRATION_SYSTEM,
-        render_extract_concentration_user(canonical_name, organic_results),
-        EXTRACT_MODEL,
-        EXTRACT_TIMEOUT_SECONDS,
+    result = run_llm_call(
+        api="chat",
+        model=EXTRACT_MODEL,
+        timeout_seconds=EXTRACT_TIMEOUT_SECONDS,
+        messages=[
+            {"role": "system", "content": EXTRACT_CONCENTRATION_SYSTEM},
+            {
+                "role": "user",
+                "content": render_extract_concentration_user(
+                    canonical_name, organic_results
+                ),
+            },
+        ],
+        check=_extract_check,
+        step="extract",
+        on_quality_failure=_record_extract_quality,
     )
-
-
-def extract_text_is_allowed(text) -> bool:
-    concentration = text.strip() if isinstance(text, str) else ""
-    compared = concentration.rstrip(".")
-    if not compared or compared.lower() == "not specified":
-        return True
-    if _EXTRACT_PERCENT.fullmatch(compared):
-        return True
-    if _EXTRACT_RANGE.fullmatch(compared):
-        return True
-    return False
+    return result.text
 
 
 @traced("prepare_concentration_update")
@@ -217,23 +247,13 @@ def process_one_ingredient(item: dict) -> None:
     """Nodes 14–21 for one loop item."""
     name = item["canonical_name"]
     serp_payload = serpapi_search(name)
-    text = None
-    for run in range(1, EXTRACT_MAX_RUNS + 1):
-        try:
-            with trace_step("extract_run") as fields:
-                fields["debug_input"] = {"run": run, "canonical_name": name}
-                text = extract_concentration(name, serp_payload)
-                fields["debug_output"] = text
-                if not extract_text_is_allowed(text):
-                    raise ValueError("extract output invalid")
-            break
-        except ValueError as exc:
-            record_rerun("extract", run, str(exc))
-            if run == EXTRACT_MAX_RUNS:
-                _record_ingredient_not_processed(
-                    name, "extract output invalid after 3 runs"
-                )
-                return
+    try:
+        text = extract_concentration(name, serp_payload)
+    except ValueError:
+        _record_ingredient_not_processed(
+            name, "extract output invalid after 3 runs"
+        )
+        return
     prepared = prepare_concentration_update(text, item)
     if prepared["skip_update"]:
         patch_not_specified(prepared["id"])

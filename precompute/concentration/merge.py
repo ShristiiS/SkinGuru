@@ -14,6 +14,17 @@ def strip_code_fences(text: str) -> str:
     return re.sub(r"```json|```", "", text).strip()
 
 
+def unwrap_items_reply(content: str) -> str:
+    """Turn {\"items\": [...]} into the JSON array merge_after_llm3/4 expect."""
+    try:
+        parsed = json.loads(strip_code_fences(content))
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return json.dumps(parsed["items"])
+    return content
+
+
 @traced("merge_after_llm1")
 def merge_after_llm1(llm1_text: str, ingredients: list) -> dict:
     """Node 5 — Merge After LLM1."""

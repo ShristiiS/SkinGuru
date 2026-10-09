@@ -23,8 +23,7 @@ from precompute.concentration.output import (
     format_estimator_output as _format_estimator_output,
 )
 from precompute.concentration.parse import parse_input as _parse_input
-from tracing import traced, trace_step
-from tracing.debug import to_jsonable
+from tracing import traced
 
 parse_input = traced("parse_input")(_parse_input)
 calculate_concentrations = traced("calculate_concentrations")(
@@ -33,27 +32,6 @@ calculate_concentrations = traced("calculate_concentrations")(
 format_estimator_output = traced("format_estimator_output")(
     _format_estimator_output
 )
-
-LLM_STEP_MAX_RUNS = 3
-
-
-def _repeat_llm_step(fn, step_name: str):
-    from precompute.flow1.product_record import record_rerun
-
-    last_error: BaseException | None = None
-    for run in range(1, LLM_STEP_MAX_RUNS + 1):
-        try:
-            with trace_step(f"{step_name}_run") as fields:
-                fields["debug_input"] = {"run": run}
-                result = fn()
-                fields["debug_output"] = to_jsonable(result)
-                return result
-        except Exception as exc:
-            last_error = exc
-            record_rerun(step_name, run, str(exc))
-            if run == LLM_STEP_MAX_RUNS:
-                raise
-    raise last_error
 
 
 def estimate_concentrations(ingredients: list) -> dict:
@@ -67,7 +45,7 @@ def estimate_concentrations(ingredients: list) -> dict:
         check_llm1(node)
         return text, node
 
-    llm1_text, node5 = _repeat_llm_step(llm1_step, "llm1")
+    llm1_text, node5 = llm1_step()
 
     def llm2_step():
         text = run_llm2(node5["product_type"], node5["ingredients"])
@@ -75,7 +53,7 @@ def estimate_concentrations(ingredients: list) -> dict:
         check_llm2(node, parsed_ingredients)
         return node
 
-    node8 = _repeat_llm_step(llm2_step, "llm2")
+    node8 = llm2_step()
 
     def llm3_step():
         text = run_llm3(
@@ -93,7 +71,7 @@ def estimate_concentrations(ingredients: list) -> dict:
         check_llm3(node, parsed_ingredients)
         return node
 
-    node11 = _repeat_llm_step(llm3_step, "llm3")
+    node11 = llm3_step()
 
     def llm4_step():
         text = run_llm4(
@@ -112,7 +90,7 @@ def estimate_concentrations(ingredients: list) -> dict:
         check_llm4(node, parsed_ingredients)
         return node
 
-    node14 = _repeat_llm_step(llm4_step, "llm4")
+    node14 = llm4_step()
 
     node15 = calculate_concentrations(node14)
     return format_estimator_output(node15, node11["product_type"])

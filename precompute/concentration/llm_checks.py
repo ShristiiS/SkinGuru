@@ -10,6 +10,18 @@ ALLOWED_PRODUCT_TYPES = frozenset(
         "ANHYDROUS",
     }
 )
+ALLOWED_PRODUCT_TYPE_LIST = (
+    "CLEANSER",
+    "SUNSCREEN",
+    "EMULSION",
+    "GEL",
+    "WATER_SERUM",
+    "ANHYDROUS",
+)
+
+
+def is_valid_product_type(value) -> bool:
+    return value in ALLOWED_PRODUCT_TYPES
 
 
 def check_llm1(node5: dict) -> None:
@@ -46,10 +58,22 @@ def _names_one_per_ingredient(rows, ingredients: list, label: str) -> None:
         raise ValueError(f"{label} missing or invented ingredient names")
 
 
+ALLOWED_CLASSIFICATIONS = frozenset({"bulk", "borderline", "low-dose"})
+ALLOWED_CLASSIFICATION_LIST = ("bulk", "borderline", "low-dose")
+ALLOWED_ZONES = frozenset({"A", "B", "C"})
+ALLOWED_ZONE_LIST = ("A", "B", "C")
+
+
 def check_llm3(node11: dict, ingredients: list) -> None:
-    _names_one_per_ingredient(
-        node11.get("classified_ingredients"), ingredients, "LLM3"
-    )
+    rows = node11.get("classified_ingredients")
+    _names_one_per_ingredient(rows, ingredients, "LLM3")
+    for row in rows:
+        classification = row.get("classification")
+        if classification not in ALLOWED_CLASSIFICATIONS:
+            raise ValueError(f"LLM3 classification invalid: {classification!r}")
+        zone = row.get("zone")
+        if zone not in ALLOWED_ZONES:
+            raise ValueError(f"LLM3 zone invalid: {zone!r}")
 
 
 def check_llm4(node14: dict, ingredients: list) -> None:

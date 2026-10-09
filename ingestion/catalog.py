@@ -4,9 +4,11 @@
 from tracing import traced
 
 PRODUCT_URLS = [
-    "https://www.nykaa.com/cetaphil-advanced-recovery-serum/p/25165279?productId=25165279&pps=2",
-    "https://www.nykaa.com/kay-beauty-rich-milky-essence/p/24369007?productId=24369007&pps=4",
-    "https://www.nykaa.com/minimalist-10percent-vitamin-c-serum-for-face-for-illuminating-skin-for-beginners/p/15022070?productId=15022070&pps=11&skuId=1068002",
+    "https://www.nykaa.com/the-derma-co-2percent-kojic-acid-face-serum-with-1percent-alpha-arbutin-niacinamide/p/3622184",
+    "https://www.nykaa.com/hyphen-dual-phase-advanced-de-pigmentation-serum/p/25233193",
+    "https://www.nykaa.com/fixderma-pigment-correcting-face-serum-for-melasma-hyperpigmentation-acne-spots/p/15753792",
+    "https://www.nykaa.com/the-derma-co-tran-zelaic-pigmentation-corrector-serum/p/15901858",
+    "https://www.nykaa.com/clayco-hyperpigmentation-mushroom-complex-serum/p/18734869",
 ]
 
 

@@ -1,16 +1,10 @@
 import json
 import re
 
-import httpx
-
-from config import (
-    OPENAI_API_URL,
-    OPENAI_TIMEOUT_SECONDS,
-    require_openai_config,
-)
+from config import OPENAI_TIMEOUT_SECONDS
 from ingestion.product_record import record_inci_dropped, record_rerun
-from precompute.call_retry import call_with_retry
-from tracing import record_http, record_llm_exchange, record_llm_usage, trace_step, traced
+from precompute.llm_call import format_llm_feedback, run_llm_call
+from tracing import traced
 
 # Verbatim from the n8n node / audit appendix. Do not edit.
 INCI_SYSTEM_PROMPT = """You are an expert cosmetic chemist with encyclopedic knowledge of INCI (International Nomenclature of Cosmetic Ingredients) standards used globally.
@@ -40,6 +34,29 @@ OUTPUT must be a JSON array of objects, one per input line, in the same order as
 
 INCI_MAX_RUNS = 3
 ALL_INCI_DROPPED_REASON = "all INCI lines dropped as non-ingredients"
+INCI_SCHEMA_NAME = "inci_lines"
+INCI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "lines": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "input": {"type": "string"},
+                    "output": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["input", "output"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["lines"],
+    "additionalProperties": False,
+}
 
 
 def _strip_fences(text: str) -> str:
@@ -90,17 +107,28 @@ def collect_inci_problems(content: str, ingredient_names: list[str]):
     return parsed, problems
 
 
-def format_inci_feedback(problems, ingredient_names) -> str:
-    lines = ["Your reply has these problems:"]
-    for problem in problems:
-        lines.append(f" - {problem}")
-    lines.append(
+def inci_feedback_extra(ingredient_names) -> list:
+    return [
         " Return the complete JSON array again with exactly "
         f"{len(ingredient_names)} objects, one per input line, in the same "
         "order. Each object must have \"input\" equal to that line and "
         '"output" a list of strings (empty [] if the line is not an ingredient).'
-    )
-    return "\n".join(lines)
+    ]
+
+
+def format_inci_feedback(problems, ingredient_names) -> str:
+    return format_llm_feedback(problems, inci_feedback_extra(ingredient_names))
+
+
+def unwrap_inci_reply(content: str) -> str:
+    """Turn {\"lines\": [...]} into the JSON array collect_inci_problems expects."""
+    try:
+        parsed = json.loads(_strip_fences(content))
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if isinstance(parsed, dict) and isinstance(parsed.get("lines"), list):
+        return json.dumps(parsed["lines"])
+    return content
 
 
 def _rows_from_parsed(items: list[dict], parsed: list) -> tuple[list[dict], list[str]]:
@@ -126,6 +154,16 @@ def _rows_from_parsed(items: list[dict], parsed: list) -> tuple[list[dict], list
     return rows, dropped
 
 
+def _inci_check(ingredient_names: list[str]):
+    def check(text: str):
+        _parsed, problems = collect_inci_problems(
+            unwrap_inci_reply(text), ingredient_names
+        )
+        return problems
+
+    return check
+
+
 @traced("llm_inci_normalizer")
 def llm_inci_normalizer(items: list[dict]) -> list[dict]:
     """Node 14 — LLM INCI Normalizer.
@@ -137,85 +175,35 @@ def llm_inci_normalizer(items: list[dict]) -> list[dict]:
 
     # Port Decision #2: raw pre-regex ingredient_name, not normalized_name.
     ingredient_names = [item["ingredient_name"] for item in items]
-    api_key = require_openai_config()
     user_content = "\n".join(ingredient_names)
-    previous_text = None
-    feedback = None
-    last_error: BaseException | None = None
 
-    for run in range(1, INCI_MAX_RUNS + 1):
-        try:
-            with trace_step("inci_normalizer_run") as fields:
-                fields["debug_input"] = {"run": run}
-                if feedback:
-                    fields["debug_input"]["problems"] = feedback
-                messages = [
-                    {"role": "system", "content": INCI_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ]
-                if previous_text is not None and feedback is not None:
-                    messages.append(
-                        {"role": "assistant", "content": previous_text}
-                    )
-                    messages.append({"role": "user", "content": feedback})
-
-                def _post_inci():
-                    response = httpx.post(
-                        OPENAI_API_URL,
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": "gpt-4o-mini",
-                            "temperature": 0,
-                            "max_tokens": 3000,
-                            "messages": messages,
-                        },
-                        timeout=OPENAI_TIMEOUT_SECONDS,
-                    )
-                    record_http(response.status_code, url=OPENAI_API_URL)
-                    response.raise_for_status()
-                    return response
-
-                payload = call_with_retry(_post_inci).json()
-                record_llm_usage(
-                    payload.get("model") or "gpt-4o-mini",
-                    payload.get("usage") or {},
-                )
-                content = payload["choices"][0]["message"]["content"] or ""
-                record_llm_exchange({"content": content})
-                previous_text = content
-
-                parsed, problems = collect_inci_problems(
-                    content, ingredient_names
-                )
-                fields["debug_output"] = {
-                    "content": content,
-                    "problems": problems,
-                }
-                if problems:
-                    feedback = format_inci_feedback(problems, ingredient_names)
-                    fields["debug_output"]["feedback"] = feedback
-                    raise ValueError("\n".join(problems))
-
-                rows, dropped = _rows_from_parsed(items, parsed)
-                fields["debug_output"]["dropped"] = dropped
-                if dropped:
-                    record_inci_dropped(dropped)
-                if not rows:
-                    raise RuntimeError(ALL_INCI_DROPPED_REASON)
-                return rows
-        except RuntimeError as exc:
-            if str(exc) == ALL_INCI_DROPPED_REASON:
-                raise
-            last_error = exc
-            record_rerun("inci_normalizer", run, str(exc))
-            if run == INCI_MAX_RUNS:
-                raise
-        except Exception as exc:
-            last_error = exc
-            record_rerun("inci_normalizer", run, str(exc))
-            if run == INCI_MAX_RUNS:
-                raise
-    raise last_error
+    result = run_llm_call(
+        api="chat",
+        model="gpt-4o-mini",
+        timeout_seconds=OPENAI_TIMEOUT_SECONDS,
+        messages=[
+            {"role": "system", "content": INCI_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        max_tokens=3000,
+        temperature=0,
+        schema_name=INCI_SCHEMA_NAME,
+        schema=INCI_SCHEMA,
+        check=_inci_check(ingredient_names),
+        step="inci_normalizer",
+        feedback_extra=inci_feedback_extra(ingredient_names),
+        on_quality_failure=lambda run, problems: record_rerun(
+            "inci_normalizer", run, "\n".join(problems)
+        ),
+    )
+    parsed, problems = collect_inci_problems(
+        unwrap_inci_reply(result.text), ingredient_names
+    )
+    if problems:
+        raise ValueError("\n".join(problems))
+    rows, dropped = _rows_from_parsed(items, parsed)
+    if dropped:
+        record_inci_dropped(dropped)
+    if not rows:
+        raise RuntimeError(ALL_INCI_DROPPED_REASON)
+    return rows

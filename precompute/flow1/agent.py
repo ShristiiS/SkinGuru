@@ -21,7 +21,7 @@ from clients.supabase import (
     store_product_safety_flags,
 )
 from precompute.call_retry import call_with_retry
-from precompute.flow1.llm import chat_completions_turn, responses_turn
+from precompute.llm_call import run_llm_call
 from tracing import record_prompt_values, trace_step
 from tracing.context import current_span_fields
 from tracing.debug import to_jsonable
@@ -63,29 +63,34 @@ class ToolBlock(Exception):
     """Python blocked the tool; ok=false without parsing the result text."""
 
 
+def _parameters_schema(tool: AgentTool) -> dict:
+    properties = {}
+    required = []
+    for spec in tool.parameters:
+        properties[spec["name"]] = {
+            "type": spec["type"],
+            "description": spec["description"],
+        }
+        required.append(spec["name"])
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
 def _openai_tools(tools: list[AgentTool]) -> list:
     out = []
     for tool in tools:
-        properties = {}
-        required = []
-        for spec in tool.parameters:
-            properties[spec["name"]] = {
-                "type": spec["type"],
-                "description": spec["description"],
-            }
-            if spec.get("required", True):
-                required.append(spec["name"])
         out.append(
             {
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    },
+                    "parameters": _parameters_schema(tool),
+                    "strict": True,
                 },
             }
         )
@@ -95,25 +100,13 @@ def _openai_tools(tools: list[AgentTool]) -> list:
 def _responses_tools(tools: list[AgentTool]) -> list:
     out = []
     for tool in tools:
-        properties = {}
-        required = []
-        for spec in tool.parameters:
-            properties[spec["name"]] = {
-                "type": spec["type"],
-                "description": spec["description"],
-            }
-            if spec.get("required", True):
-                required.append(spec["name"])
         out.append(
             {
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
+                "parameters": _parameters_schema(tool),
+                "strict": True,
             }
         )
     return out
@@ -204,6 +197,7 @@ def run_tools_agent(
     nudge_if_tool_missing=None,
     nudge_missing_message=None,
     tool_log=None,
+    extra_user=None,
 ) -> AgentRunResult:
     """n8n Tools Agent v3: up to 10 model calls; tool errors go back to the model."""
     openai_tools = _openai_tools(tools)
@@ -212,6 +206,8 @@ def run_tools_agent(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    if extra_user:
+        messages.append({"role": "user", "content": extra_user})
     agent_log = {"model_calls": [], "stop_reason": None}
     parent_fields = current_span_fields()
     if parent_fields is not None:
@@ -222,13 +218,17 @@ def run_tools_agent(
     nudged = False
     for call_number in range(1, max_calls + 1):
         with trace_step("tools_agent_llm"):
-            message = chat_completions_turn(
-                messages,
-                model,
-                timeout_seconds,
+            result = run_llm_call(
+                api="chat",
+                model=model,
+                timeout_seconds=timeout_seconds,
+                messages=messages,
                 max_completion_tokens=max_completion_tokens,
                 tools=openai_tools,
+                step="tools_agent_llm",
+                append_failed_reply=False,
             )
+            message = result.message
         turn = {
             "n": call_number,
             "reply": message.get("content") or "",
@@ -306,6 +306,7 @@ def run_tools_agent_responses(
     tools: list[AgentTool],
     max_output_tokens=None,
     max_calls=MAX_AGENT_MODEL_CALLS,
+    extra_user=None,
 ) -> AgentRunResult:
     """Interaction Builder only: Responses API tool loop."""
     openai_tools = _responses_tools(tools)
@@ -314,6 +315,8 @@ def run_tools_agent_responses(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    if extra_user:
+        input_items.append({"role": "user", "content": extra_user})
     agent_log = {"model_calls": [], "stop_reason": None}
     parent_fields = current_span_fields()
     if parent_fields is not None:
@@ -322,13 +325,17 @@ def run_tools_agent_responses(
     tool_log = []
     for call_number in range(1, max_calls + 1):
         with trace_step("tools_agent_llm"):
-            message = responses_turn(
-                input_items,
-                model,
-                timeout_seconds,
+            result = run_llm_call(
+                api="responses",
+                model=model,
+                timeout_seconds=timeout_seconds,
+                input_items=input_items,
                 tools=openai_tools,
                 max_output_tokens=max_output_tokens,
+                step="tools_agent_llm",
+                append_failed_reply=False,
             )
+            message = result.message
         turn = {
             "n": call_number,
             "reply": message.get("content") or "",
@@ -438,7 +445,9 @@ def concern_agent_tools(tool_log, product_id, synergy):
 CONCERN_AGENT_TOOLS = concern_agent_tools([], None, None)
 
 
-def run_concern_agent(node22: dict, node23, synergy_text: str, synergy=None) -> str:
+def run_concern_agent(
+    node22: dict, node23, synergy_text: str, synergy=None, extra_user=None
+) -> str:
     from precompute.flow1.prompts import (
         CONCERN_AGENT_SYSTEM,
         render_concern_agent_user,
@@ -465,6 +474,7 @@ def run_concern_agent(node22: dict, node23, synergy_text: str, synergy=None) -> 
         list(concern_agent_tools(tool_log, node22["product_id"], synergy)),
         max_completion_tokens=32768,
         tool_log=tool_log,
+        extra_user=extra_user,
     )
 
 
@@ -781,6 +791,9 @@ def _run_save_llm_interaction(args: dict) -> str:
     severity = args.get("severity")
     if severity in (None, ""):
         severity = None
+    irritation = args.get("is_irritation_related")
+    if irritation is None:
+        irritation = None
     return call_with_retry(
         save_llm_interaction,
         args["ingredient_a"],
@@ -788,7 +801,7 @@ def _run_save_llm_interaction(args: dict) -> str:
         args["raw_type"],
         severity,
         args["reason"],
-        args.get("is_irritation_related"),
+        irritation,
     )
 
 
@@ -876,9 +889,8 @@ INTERACTION_BUILDER_AGENT_TOOLS = (
             },
             {
                 "name": "severity",
-                "type": "string",
+                "type": ["string", "null"],
                 "description": "",
-                "required": False,
             },
             {
                 "name": "reason",
@@ -887,9 +899,8 @@ INTERACTION_BUILDER_AGENT_TOOLS = (
             },
             {
                 "name": "is_irritation_related",
-                "type": "boolean",
+                "type": ["boolean", "null"],
                 "description": "",
-                "required": False,
             },
         ),
         run=_run_save_llm_interaction,
@@ -898,7 +909,7 @@ INTERACTION_BUILDER_AGENT_TOOLS = (
 
 
 def run_interaction_builder_agent(
-    product_id, model="gpt-5.6-luna", timeout=300.0
+    product_id, model="gpt-5.6-luna", timeout=300.0, extra_user=None
 ):
     from precompute.flow1.prompts import (
         INTERACTION_BUILDER_AGENT_SYSTEM,
@@ -915,11 +926,16 @@ def run_interaction_builder_agent(
         list(INTERACTION_BUILDER_AGENT_TOOLS),
         max_output_tokens=32768,
         max_calls=50,
+        extra_user=extra_user,
     )
 
 
 def run_safety_agent(
-    node22: dict, interaction_result, model="gpt-5.4-mini", timeout=300.0
+    node22: dict,
+    interaction_result,
+    model="gpt-5.4-mini",
+    timeout=300.0,
+    extra_user=None,
 ) -> str:
     from precompute.flow1.prompts import (
         SAFETY_AGENT_SYSTEM,
@@ -943,10 +959,11 @@ def run_safety_agent(
         timeout,
         build_safety_agent_tools(node22["product_id"], interaction_result),
         max_completion_tokens=32768,
+        extra_user=extra_user,
     )
 
 
-def run_formulation_agent(node22: dict) -> str:
+def run_formulation_agent(node22: dict, extra_user=None) -> str:
     from precompute.flow1.prompts import (
         FORMULATION_AGENT_SYSTEM,
         render_formulation_agent_user,
@@ -973,4 +990,5 @@ def run_formulation_agent(node22: dict) -> str:
         nudge_if_tool_missing="store_formulation_score",
         nudge_missing_message=FORMULATION_STORE_NUDGE,
         tool_log=tool_log,
+        extra_user=extra_user,
     )

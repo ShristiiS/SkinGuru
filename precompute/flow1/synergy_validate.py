@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 
+from precompute.llm_call import format_llm_feedback
+
 STRENGTH_SCORES = {
     "Strong": 0.166,
     "Moderate": 0.10,
@@ -10,6 +12,7 @@ STRENGTH_SCORES = {
     "None": 0,
 }
 _SYNERGY_ENTRY_KEYS = ("concern", "pairs", "strength", "reason", "score")
+SYNERGY_SCHEMA_NAME = "synergy_reply"
 
 
 def _cleanup_raw(raw):
@@ -131,17 +134,60 @@ def collect_synergy_problems(text, concern_keys) -> tuple:
     return parsed, problems
 
 
-def format_synergy_feedback(problems, concern_keys) -> str:
+def synergy_feedback_extra(concern_keys) -> list:
     keys = list(concern_keys) if isinstance(concern_keys, list) else []
-    lines = ["Your reply has these problems:"]
-    for problem in problems:
-        lines.append(f" - {problem}")
     listed = ", ".join(str(key) for key in keys)
-    lines.append(
+    return [
         " Return the complete JSON again with exactly one entry for each of "
         f"these {len(keys)} concerns: {listed}."
-    )
-    return "\n".join(lines)
+    ]
+
+
+def format_synergy_feedback(problems, concern_keys) -> str:
+    return format_llm_feedback(problems, synergy_feedback_extra(concern_keys))
+
+
+def build_synergy_schema(concern_keys) -> dict:
+    keys = []
+    seen = set()
+    for key in concern_keys if isinstance(concern_keys, list) else []:
+        name = str(key)
+        if name in seen:
+            continue
+        seen.add(name)
+        keys.append(name)
+    concern_prop = {"type": "string"}
+    if keys:
+        concern_prop["enum"] = keys
+    return {
+        "type": "object",
+        "properties": {
+            "synergies": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "concern": concern_prop,
+                        "pairs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "strength": {
+                            "type": "string",
+                            "enum": list(STRENGTH_SCORES),
+                        },
+                        "reason": {"type": "string"},
+                        "score": {"type": "number"},
+                    },
+                    "required": list(_SYNERGY_ENTRY_KEYS),
+                    "additionalProperties": False,
+                },
+            },
+            "total_synergy_score": {"type": "number"},
+        },
+        "required": ["synergies", "total_synergy_score"],
+        "additionalProperties": False,
+    }
 
 
 def validate_synergy_reply(text, concern_keys) -> dict:

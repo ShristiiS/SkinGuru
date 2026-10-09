@@ -73,6 +73,10 @@ def _estimator_extra(record: ProductRecord, status: str) -> str | None:
             notes.append(
                 f"{label} run {last.get('run')} of {_MAX_RUNS}: {last.get('reason')}"
             )
+    if status == "OK" and reason:
+        if notes:
+            return "(" + reason + "; " + "; ".join(notes) + ")"
+        return f"({reason})"
     if notes:
         if status == "OK":
             return "(" + "; ".join(notes) + ")"

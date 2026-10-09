@@ -296,6 +296,46 @@ def get_product_concentration_row(product_id) -> list[dict]:
     return payload
 
 
+@traced("supabase.get_product_concentration_fields")
+def get_product_concentration_fields(product_id) -> list[dict]:
+    """GET product_concentrations concentrations + formulation_product_type. Not node 5."""
+    _, key = require_supabase_config()
+    endpoint = _rest(
+        f"product_concentrations?product_id=eq.{product_id}"
+        f"&select=concentrations,formulation_product_type&limit=1"
+    )
+    response = _capture(httpx.get(endpoint, headers=_headers(key), timeout=30.0))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"Unexpected product_concentrations response: {payload!r}"
+        )
+    return payload
+
+
+@traced("supabase.patch_product_concentrations")
+def patch_product_concentrations(
+    product_id, concentrations, formulation_product_type
+) -> None:
+    """PATCH product_concentrations?product_id=eq.{id}. No on_conflict."""
+    _, key = require_supabase_config()
+    endpoint = _rest(f"product_concentrations?product_id=eq.{product_id}")
+    response = _capture(
+        httpx.patch(
+            endpoint,
+            headers=_headers(key, prefer="return=representation"),
+            json={
+                "product_id": product_id,
+                "concentrations": concentrations,
+                "formulation_product_type": formulation_product_type,
+            },
+            timeout=30.0,
+        )
+    )
+    response.raise_for_status()
+
+
 @traced("supabase.store_approx_concentrations")
 def store_approx_concentrations(
     product_id, concentrations, formulation_product_type

@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import re
 
+from precompute.concentration.llm_checks import (
+    ALLOWED_PRODUCT_TYPE_LIST,
+    is_valid_product_type,
+)
 from precompute.flow1.value_equal import values_equal
 
 _REQUIRED_GETS = (
@@ -130,12 +134,16 @@ def collect_formulation_store_problems(store_data, tool_log, node22) -> list:
             f"product_id {parsed_store.get('product_id')}, must be "
             f"{pipeline.get('product_id')}"
         )
-    if parsed_store.get("formulation_product_type") != pipeline.get(
-        "formulation_product_type"
-    ):
+    stored_type = parsed_store.get("formulation_product_type")
+    if not is_valid_product_type(stored_type):
+        problems.append(
+            f"formulation_product_type {stored_type}, must be one of "
+            + ", ".join(ALLOWED_PRODUCT_TYPE_LIST)
+        )
+    if stored_type != pipeline.get("formulation_product_type"):
         problems.append(
             f"formulation_product_type "
-            f"{parsed_store.get('formulation_product_type')}, must be "
+            f"{stored_type}, must be "
             f"{pipeline.get('formulation_product_type')}"
         )
 
