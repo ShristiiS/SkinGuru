@@ -429,6 +429,57 @@ def get_formulation_type_from_scores(product_id) -> list:
     return payload
 
 
+@traced("supabase.get_product_concern_score_keys")
+def get_product_concern_score_keys(product_id) -> list:
+    """GET product_concern_scores?select=concern_key. Already-computed check."""
+    _, key = require_supabase_config()
+    endpoint = _rest(
+        f"product_concern_scores?product_id=eq.{product_id}&select=concern_key"
+    )
+    response = _capture(httpx.get(endpoint, headers=_headers(key), timeout=30.0))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"Unexpected product_concern_scores response: {payload!r}"
+        )
+    return payload
+
+
+@traced("supabase.get_product_safety_flag_row")
+def get_product_safety_flag_row(product_id) -> list:
+    """GET product_safety_flags?select=product_id&limit=1. Already-computed check."""
+    _, key = require_supabase_config()
+    endpoint = _rest(
+        f"product_safety_flags?product_id=eq.{product_id}"
+        f"&select=product_id&limit=1"
+    )
+    response = _capture(httpx.get(endpoint, headers=_headers(key), timeout=30.0))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"Unexpected product_safety_flags response: {payload!r}"
+        )
+    return payload
+
+
+@traced("supabase.get_product_scores_computation_row")
+def get_product_scores_computation_row(product_id) -> list:
+    """GET product_scores?select=formulation_score,formulation_product_type."""
+    _, key = require_supabase_config()
+    endpoint = _rest(
+        f"product_scores?product_id=eq.{product_id}"
+        f"&select=formulation_score,formulation_product_type"
+    )
+    response = _capture(httpx.get(endpoint, headers=_headers(key), timeout=30.0))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Unexpected product_scores response: {payload!r}")
+    return payload
+
+
 @traced("supabase.get_formulation_type_from_concentrations")
 def get_formulation_type_from_concentrations(product_id) -> list:
     """Flow 1 node 22 — GET product_concentrations?select=formulation_product_type."""

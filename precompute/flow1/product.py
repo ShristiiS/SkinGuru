@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from clients.supabase import (
     get_precompute_product_ingredients,
+    get_product_concern_data,
+    get_product_concern_score_keys,
     get_product_concentration_row,
+    get_product_safety_flag_row,
+    get_product_scores_computation_row,
 )
 from precompute.call_retry import call_with_retry
 from precompute.flow1.estimate_store import (
@@ -59,11 +63,86 @@ def already_exists(items: list) -> bool:
     )
 
 
+def _concern_keys_from_data(data) -> list | None:
+    if not isinstance(data, dict):
+        return None
+    keys = data.get("concern_keys")
+    if not isinstance(keys, list) or not keys:
+        return None
+    return [str(key) for key in keys]
+
+
+def _nonempty_rows(rows) -> bool:
+    return any(isinstance(item, dict) and len(item.keys()) > 0 for item in rows or [])
+
+
+def _concern_complete(product_id) -> bool:
+    data = call_with_retry(get_product_concern_data, product_id)
+    expected = _concern_keys_from_data(data)
+    if expected is None:
+        return False
+    rows = call_with_retry(get_product_concern_score_keys, product_id)
+    have = {
+        row.get("concern_key")
+        for row in rows or []
+        if isinstance(row, dict)
+    }
+    return set(expected).issubset(have)
+
+
+def _safety_complete(product_id) -> bool:
+    rows = call_with_retry(get_product_safety_flag_row, product_id)
+    return _nonempty_rows(rows)
+
+
+def _formulation_complete(product_id) -> bool:
+    rows = call_with_retry(get_product_scores_computation_row, product_id)
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("formulation_score") is None:
+            continue
+        if is_valid_product_type(row.get("formulation_product_type")):
+            return True
+    return False
+
+
+@traced("check_already_computed")
+def missing_precompute_parts(product_id) -> list[str]:
+    """Return which of concern/safety/formulation are not fully stored."""
+    missing = []
+    try:
+        if not _concern_complete(product_id):
+            missing.append("concern")
+    except Exception:
+        missing.append("concern")
+    try:
+        if not _safety_complete(product_id):
+            missing.append("safety")
+    except Exception:
+        missing.append("safety")
+    try:
+        if not _formulation_complete(product_id):
+            missing.append("formulation")
+    except Exception:
+        missing.append("formulation")
+    return missing
+
+
 @traced("process_one_product")
 def process_one_product(product_id) -> dict:
     """Nodes 4–36. Node 42 is a no-op; the caller loops to the next product."""
     with bind_product(str(product_id)), bind_product_record(product_id):
         try:
+            missing = missing_precompute_parts(product_id)
+            record = current_product_record()
+            if record is not None:
+                record.missing = list(missing)
+            if not missing:
+                if record is not None:
+                    record.skipped = True
+                    record.missing = []
+                return {"product_id": product_id, "already_computed": True}
             try:
                 node4 = get_product_ingredients(product_id)
                 record_step("ingredients", "OK")

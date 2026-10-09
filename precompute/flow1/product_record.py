@@ -19,6 +19,8 @@ class ProductRecord:
     reruns: list = field(default_factory=list)
     steps: dict = field(default_factory=dict)
     synergy_parsed: object = None
+    skipped: bool = False
+    missing: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {

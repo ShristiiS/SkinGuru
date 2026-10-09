@@ -143,8 +143,13 @@ def format_status_line(name: str, status: str, extra: str | None = None) -> str:
 
 
 def format_status_block(record: ProductRecord) -> str:
+    if record.skipped:
+        return f"PRODUCT {record.product_id} — SKIPPED (already computed)\n"
     overall = product_status(record)
-    lines = [f"PRODUCT {record.product_id} — {overall}"]
+    header = f"PRODUCT {record.product_id} — {overall}"
+    if record.missing:
+        header += "  missing: " + ", ".join(str(part) for part in record.missing)
+    lines = [header]
     for name in STATUS_STEPS:
         status = _step_status(record, name)
         extra = extra_for(record, name, status)
