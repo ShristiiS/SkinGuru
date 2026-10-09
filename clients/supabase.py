@@ -106,6 +106,42 @@ def insert_product(fields: dict) -> list[dict]:
     return payload
 
 
+def format_canonical_name_in_filter(names: list[str]) -> str:
+    r"""PostgREST in.() with each value double-quoted; \ -> \\ and " -> \"."""
+    quoted = []
+    for name in names:
+        escaped = str(name).replace("\\", "\\\\").replace('"', '\\"')
+        quoted.append(f'"{escaped}"')
+    return "in.(" + ",".join(quoted) + ")"
+
+
+@traced("supabase.get_ingredients_by_canonical_names")
+def get_ingredients_by_canonical_names(names: list[str]) -> list[dict]:
+    """GET /ingredients?select=canonical_name&canonical_name=in.(...) via httpx params."""
+    if not names:
+        return []
+    _, key = require_supabase_config()
+    endpoint = _rest("ingredients")
+    response = _capture(
+        httpx.get(
+            endpoint,
+            headers=_headers(key),
+            params={
+                "select": "canonical_name",
+                "canonical_name": format_canonical_name_in_filter(names),
+            },
+            timeout=30.0,
+        )
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"Unexpected ingredients lookup response: {payload!r}"
+        )
+    return payload
+
+
 @traced("supabase.match_ingredients")
 def match_ingredients(names: list[str]) -> list[dict]:
     """Node 17 — POST /rpc/match_ingredients with {names: unique list}. Matching stays in Supabase."""

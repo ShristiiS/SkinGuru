@@ -105,6 +105,9 @@ def extra_for(record: ProductRecord, name: str, status: str) -> str | None:
         if reruns and extra:
             bits.append(extra)
 
+    if name == "inci_normalizer" and record.warnings:
+        bits.append("warning: " + "; ".join(str(item) for item in record.warnings))
+
     np_extra = _np_list(_not_processed_for_step(record, name))
     if np_extra:
         if status == "NOT PROCESSED":

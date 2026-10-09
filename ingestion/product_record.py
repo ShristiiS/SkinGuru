@@ -33,6 +33,7 @@ class ProductRecord:
     reruns: list = field(default_factory=list)
     steps: dict = field(default_factory=dict)
     inci_dropped: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 
 
 def current_product_record() -> ProductRecord | None:
@@ -87,6 +88,13 @@ def record_inci_dropped(names: list[str]) -> None:
     if record is None:
         return
     record.inci_dropped.extend(names)
+
+
+def record_warning(message: str) -> None:
+    record = current_product_record()
+    if record is None:
+        return
+    record.warnings.append(str(message))
 
 
 def record_step(step: str, status: str, reason: str | None = None) -> None:
