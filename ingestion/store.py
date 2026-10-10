@@ -11,6 +11,73 @@ STORE_MAX_RUNS = 3
 STORE_MISSING_REASON = "missing from re-GET"
 
 
+def _dedupe_key(ing: dict):
+    ingredient_id = ing.get("ingredient_id")
+    if ingredient_id is None:
+        return None
+    return (ing.get("product_id"), ingredient_id)
+
+
+def _display_order_sort_key(ing: dict):
+    order = ing.get("display_order")
+    if order is None:
+        return (1, 0)
+    return (0, order)
+
+
+def _dedupe_note(kept: dict, skipped: list[dict]) -> str:
+    orders = ", ".join(str(row.get("display_order")) for row in skipped)
+    labels = ", ".join(
+        f"'{row.get('as_listed_on_label')}'" for row in skipped
+    )
+    return (
+        f"{kept.get('ingredient_name')}: kept display_order "
+        f"{kept.get('display_order')}, skipped {orders} ({labels})"
+    )
+
+
+def dedupe_product_ingredients(ingredients: list[dict]) -> list[dict]:
+    """Keep the lowest display_order per (product_id, ingredient_id). Deliberate change from n8n."""
+    groups: dict = {}
+    for ing in ingredients:
+        key = _dedupe_key(ing)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(ing)
+
+    seen = set()
+    result = []
+    notes = []
+    for ing in ingredients:
+        key = _dedupe_key(ing)
+        if key is None:
+            result.append(ing)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        group = groups[key]
+        if len(group) == 1:
+            result.append(ing)
+            continue
+        kept = min(group, key=_display_order_sort_key)
+        skipped = [row for row in group if row is not kept]
+        skipped.sort(key=_display_order_sort_key)
+        merged = {
+            **kept,
+            "is_key_ingredient": any(
+                row.get("is_key_ingredient") is True for row in group
+            ),
+        }
+        result.append(merged)
+        notes.append(_dedupe_note(kept, skipped))
+
+    with trace_step("dedupe_product_ingredients") as fields:
+        fields["debug_input"] = {"count": len(ingredients)}
+        fields["debug_output"] = notes
+    return result
+
+
 def _upsert_row(ing: dict) -> None:
     call_with_retry(
         upsert_product_ingredient,
@@ -48,6 +115,7 @@ def store_product_ingredients(
     ingredients: list[dict], written: ProductWriteResult
 ) -> tuple[list[dict], list[dict]]:
     """Node 25 store + node 28 re-GET. Missing matched ids: re-store those rows, max 3 runs."""
+    ingredients = dedupe_product_ingredients(ingredients)
     sent_matched = [ing for ing in ingredients if ing.get("matched") is True]
     pending = list(ingredients)
     stored: list[dict] = []
