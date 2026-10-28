@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 
+from precompute.concentration.helpers import compact_json
+from precompute.flow1.claims_check import (
+    check_concern_texts,
+    product_names_from_context,
+)
 from precompute.flow1.value_equal import ingredients_equal
 
-_CONCERN_COUNT = 15
-_CONTRIBUTING_KEYS = (
-    "ingredient_name",
-    "tier",
-    "tier_value",
-    "effective_value",
-    "concentration_status",
-    "required_concentration",
-    "approximate_concentration",
-    "mechanism",
+_TEXT_FIELDS = (
+    "concern_reasoning",
+    "bonus_reasoning",
+    "synergy_reasoning",
+    "full_explanation",
 )
 
 
@@ -98,24 +99,6 @@ def _synergy_entry(synergy: dict, concern_key):
     return None
 
 
-def _contributing_format_problems(rows, label: str, concern_key) -> list:
-    if not isinstance(rows, list):
-        return [f"concern {concern_key!r} {label} is not a list"]
-    problems = []
-    for item in rows:
-        if not isinstance(item, dict):
-            problems.append(
-                f"concern {concern_key!r} {label} item missing fields"
-            )
-            continue
-        missing = [key for key in _CONTRIBUTING_KEYS if key not in item]
-        if missing:
-            problems.append(
-                f"concern {concern_key!r} {label} item missing fields"
-            )
-    return problems
-
-
 def _synergy_pair_names(value):
     """[] or exactly two non-empty name strings. None if the shape is wrong."""
     if not isinstance(value, list):
@@ -159,6 +142,8 @@ def _name_or_first_word_in(name: str, text_cf: str) -> bool:
 def _synergy_reasoning_ok(text, entry) -> bool:
     if _empty_text(text):
         return False
+    if not isinstance(entry, dict):
+        return False
     if entry.get("strength") == "None":
         return True
     if _reason_equal(text, entry.get("reason")):
@@ -171,8 +156,188 @@ def _synergy_reasoning_ok(text, entry) -> bool:
     return False
 
 
+def parse_calculate_concern_rows(raw):
+    parsed, err = _try_parse_json(raw, "calculate_concern_scores result")
+    if err or not isinstance(parsed, list):
+        return None
+    rows = [
+        row
+        for row in parsed
+        if isinstance(row, dict) and row.get("concern_key") is not None
+    ]
+    if not rows:
+        return None
+    return rows
+
+
+def _trace_value(value) -> str:
+    try:
+        return compact_json(value)
+    except Exception:
+        return str(value)
+
+
+def _sql_values(calc_row: dict) -> dict:
+    contributing = copy.deepcopy(calc_row.get("concern_contributing_ingredients"))
+    bonus = calc_row.get("bonus_contributing_ingredients")
+    if bonus is None:
+        bonus = copy.deepcopy(contributing)
+    else:
+        bonus = copy.deepcopy(bonus)
+    return {
+        "concern_score": calc_row.get("concern_score"),
+        "bonus_score": calc_row.get("bonus_score"),
+        "concern_contributing_ingredients": contributing,
+        "bonus_contributing_ingredients": bonus,
+    }
+
+
+def _synergy_values(synergy, key) -> dict:
+    entry = _synergy_entry(synergy if isinstance(synergy, dict) else {}, key)
+    if not isinstance(entry, dict):
+        return {"synergy_score": 0, "synergy_pairs": []}
+    pairs = entry.get("pairs")
+    if pairs is None:
+        pairs = []
+    else:
+        pairs = copy.deepcopy(pairs)
+    return {"synergy_score": entry.get("score"), "synergy_pairs": pairs}
+
+
+def _synergy_pairs_equal(left, right) -> bool:
+    left_names = _synergy_pair_names(left)
+    right_names = _synergy_pair_names(right)
+    if left_names is None or right_names is None:
+        return False
+    return _pair_key(left_names) == _pair_key(right_names)
+
+
+def _values_mismatch(field, agent, source) -> bool:
+    if field in (
+        "concern_contributing_ingredients",
+        "bonus_contributing_ingredients",
+    ):
+        return not ingredients_equal(agent, source)
+    if field == "synergy_pairs":
+        return not _synergy_pairs_equal(agent, source)
+    return agent != source
+
+
+def _empty_texts() -> dict:
+    return {field: "" for field in _TEXT_FIELDS}
+
+
+def correct_concern_store_values(store_data, calc_rows, product_id, synergy):
+    """Overwrite value columns from SQL / Synergy. Return (json, traces, added_keys)."""
+    traces = []
+    added_keys = set()
+    parsed_store, store_err = _try_parse_json(store_data, "store data")
+    if store_err or not isinstance(parsed_store, list):
+        return store_data, traces, added_keys
+    if not isinstance(calc_rows, list) or not calc_rows:
+        return store_data, traces, added_keys
+
+    agent_by_key = {}
+    for row in parsed_store:
+        if not isinstance(row, dict):
+            continue
+        key = row.get("concern_key")
+        if key in agent_by_key:
+            continue
+        agent_by_key[key] = row
+
+    calc_by_key = {}
+    sql_keys = []
+    for calc_row in calc_rows:
+        if not isinstance(calc_row, dict):
+            continue
+        key = calc_row.get("concern_key")
+        if key is None or key in calc_by_key:
+            continue
+        calc_by_key[key] = calc_row
+        sql_keys.append(key)
+
+    corrected = []
+    for key in sql_keys:
+        sql_vals = _sql_values(calc_by_key[key])
+        syn_vals = _synergy_values(synergy, key)
+        agent_row = agent_by_key.get(key)
+        if agent_row is None:
+            row = {
+                "product_id": product_id,
+                "concern_key": key,
+            }
+            row.update(sql_vals)
+            row.update(syn_vals)
+            row.update(_empty_texts())
+            traces.append(
+                f"concern_correction: {key} missing from agent output "
+                "-> added from SQL, texts empty"
+            )
+            added_keys.add(key)
+            corrected.append(row)
+            continue
+        row = dict(agent_row)
+        row["product_id"] = product_id
+        row["concern_key"] = key
+        replacements = (
+            ("concern_score", sql_vals["concern_score"], "sql"),
+            ("bonus_score", sql_vals["bonus_score"], "sql"),
+            (
+                "concern_contributing_ingredients",
+                sql_vals["concern_contributing_ingredients"],
+                "sql",
+            ),
+            (
+                "bonus_contributing_ingredients",
+                sql_vals["bonus_contributing_ingredients"],
+                "sql",
+            ),
+            ("synergy_score", syn_vals["synergy_score"], "synergy"),
+            ("synergy_pairs", syn_vals["synergy_pairs"], "synergy"),
+        )
+        for field, source, origin in replacements:
+            agent_val = row.get(field)
+            if _values_mismatch(field, agent_val, source):
+                traces.append(
+                    f"concern_correction: {key}.{field} "
+                    f"agent={_trace_value(agent_val)} -> "
+                    f"{origin}={_trace_value(source)}"
+                )
+                row[field] = source
+        corrected.append(row)
+
+    for key in agent_by_key:
+        if key not in calc_by_key:
+            traces.append(
+                f"concern_correction: {key} extra in agent output -> removed"
+            )
+
+    if not traces:
+        return store_data, traces, added_keys
+    return compact_json(corrected), traces, added_keys
+
+
+def _rows_for_text_checks(rows, calc_by_key, skip_keys) -> list:
+    skip = set(skip_keys or ())
+    checked = []
+    seen = set()
+    for row in rows:
+        key = row.get("concern_key")
+        if key in skip or key not in calc_by_key or key in seen:
+            continue
+        seen.add(key)
+        checked.append(row)
+    return checked
+
+
 def collect_concern_store_problems(
-    store_data, calc_entry, product_id, synergy
+    store_data,
+    calc_entry,
+    product_id,
+    synergy,
+    concern_data=None,
+    skip_keys=None,
 ) -> list:
     problems = []
     parsed_store, store_err = _try_parse_json(store_data, "store data")
@@ -180,26 +345,7 @@ def collect_concern_store_problems(
         return [store_err]
     if not isinstance(parsed_store, list):
         return ["store data is not valid JSON"]
-    if len(parsed_store) != _CONCERN_COUNT:
-        problems.append("store data is not exactly 15 concerns")
-    store_keys = []
-    rows = []
-    for row in parsed_store:
-        if not isinstance(row, dict):
-            problems.append("store data is not exactly 15 concerns")
-            continue
-        rows.append(row)
-        store_keys.append(row.get("concern_key"))
-    if len(store_keys) != len(set(store_keys)):
-        problems.append("duplicate concern_key")
-
-    pipeline_id = _as_int(product_id)
-    for row in rows:
-        row_id = _as_int(row.get("product_id"))
-        if row_id != pipeline_id:
-            problems.append(
-                f"product_id {row.get('product_id')}, must be {product_id}"
-            )
+    rows = [row for row in parsed_store if isinstance(row, dict)]
 
     parsed_calc = None
     if calc_entry is not None:
@@ -218,106 +364,55 @@ def collect_concern_store_problems(
             if isinstance(row, dict) and row.get("concern_key") not in calc_by_key:
                 calc_by_key[row.get("concern_key")] = row
 
-    for row in rows:
-        key = row.get("concern_key")
-        calc_row = calc_by_key.get(key)
-        if calc_row is None:
-            problems.append(f"concern {key!r} missing from calculate result")
-            continue
-        if row.get("concern_score") != calc_row.get("concern_score"):
-            problems.append(
-                f"concern {key!r} concern_score {row.get('concern_score')}, "
-                f"must be {calc_row.get('concern_score')}"
-            )
-        if row.get("bonus_score") != calc_row.get("bonus_score"):
-            problems.append(
-                f"concern {key!r} bonus_score {row.get('bonus_score')}, "
-                f"must be {calc_row.get('bonus_score')}"
-            )
-        if not ingredients_equal(
-            row.get("concern_contributing_ingredients"),
-            calc_row.get("concern_contributing_ingredients"),
-        ):
-            problems.append(
-                f"concern {key!r} concern_contributing_ingredients, "
-                f"must match calculate"
-            )
-        if "bonus_contributing_ingredients" not in row:
-            problems.append(
-                f"concern {key!r} bonus_contributing_ingredients missing"
-            )
-        elif not ingredients_equal(
-            row.get("bonus_contributing_ingredients"),
-            calc_row.get("concern_contributing_ingredients"),
-        ):
-            problems.append(
-                f"concern {key!r} bonus_contributing_ingredients, "
-                f"must match calculate concern_contributing_ingredients"
-            )
-
+    checked_rows = _rows_for_text_checks(rows, calc_by_key, skip_keys)
     synergy_obj = synergy if isinstance(synergy, dict) else {}
-    for row in rows:
+    for row in checked_rows:
         key = row.get("concern_key")
         entry = _synergy_entry(synergy_obj, key)
-        if entry is None:
-            problems.append(f"concern {key!r} missing from synergy reply")
-            continue
-        if row.get("synergy_score") != entry.get("score"):
-            problems.append(
-                f"concern {key!r} synergy_score {row.get('synergy_score')}, "
-                f"must be {entry.get('score')}"
-            )
-        store_pair = _synergy_pair_names(row.get("synergy_pairs"))
-        if store_pair is None:
-            problems.append(
-                f"concern {key!r} synergy_pairs is not [] or two names"
-            )
-        else:
-            synergy_pair = _synergy_pair_names(entry.get("pairs"))
-            if synergy_pair is None or _pair_key(store_pair) != _pair_key(
-                synergy_pair
-            ):
-                problems.append(
-                    f"concern {key!r} synergy_pairs, must match synergy pairs"
-                )
         if _empty_text(row.get("synergy_reasoning")):
             problems.append(f"concern {key!r} synergy_reasoning empty")
         elif not _synergy_reasoning_ok(row.get("synergy_reasoning"), entry):
             problems.append(f"concern {key!r} synergy_reasoning does not match")
-
-    for row in rows:
-        key = row.get("concern_key")
         if _empty_text(row.get("concern_reasoning")):
             problems.append(f"concern {key!r} concern_reasoning empty")
         if _empty_text(row.get("bonus_reasoning")):
             problems.append(f"concern {key!r} bonus_reasoning empty")
         if _empty_text(row.get("full_explanation")):
             problems.append(f"concern {key!r} full_explanation empty")
-        problems.extend(
-            _contributing_format_problems(
-                row.get("concern_contributing_ingredients"),
-                "concern_contributing_ingredients",
-                key,
-            )
+    problems.extend(
+        check_concern_texts(
+            checked_rows,
+            calc_by_key,
+            synergy,
+            product_names_from_context(product_id),
+            concern_data,
         )
-        problems.extend(
-            _contributing_format_problems(
-                row.get("bonus_contributing_ingredients"),
-                "bonus_contributing_ingredients",
-                key,
-            )
-        )
+    )
     return problems
 
 
-def concern_store_precheck(store_data, tool_log, product_id, synergy):
-    calc_entry = last_successful(tool_log, "calculate_concern_scores")
+def concern_store_precheck(
+    store_data,
+    tool_log,
+    product_id,
+    synergy,
+    concern_data=None,
+    calc_entry=None,
+    skip_keys=None,
+):
+    if calc_entry is None:
+        calc_entry = last_successful(tool_log, "calculate_concern_scores")
     if calc_entry is None:
         return (
             "ERROR: call calculate_concern_scores successfully before storing."
         )
     problems = collect_concern_store_problems(
-        store_data, calc_entry, product_id, synergy
+        store_data,
+        calc_entry,
+        product_id,
+        synergy,
+        concern_data,
+        skip_keys=skip_keys,
     )
     if not problems:
         return None

@@ -21,6 +21,7 @@ class ProductRecord:
     synergy_parsed: object = None
     skipped: bool = False
     missing: list = field(default_factory=list)
+    ingredient_names: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {

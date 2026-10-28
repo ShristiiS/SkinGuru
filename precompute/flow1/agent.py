@@ -307,6 +307,7 @@ def run_tools_agent_responses(
     max_output_tokens=None,
     max_calls=MAX_AGENT_MODEL_CALLS,
     extra_user=None,
+    tool_log=None,
 ) -> AgentRunResult:
     """Interaction Builder only: Responses API tool loop."""
     openai_tools = _responses_tools(tools)
@@ -322,7 +323,8 @@ def run_tools_agent_responses(
     if parent_fields is not None:
         parent_fields["agent_debug"] = agent_log
     last_text = ""
-    tool_log = []
+    if tool_log is None:
+        tool_log = []
     for call_number in range(1, max_calls + 1):
         with trace_step("tools_agent_llm"):
             result = run_llm_call(
@@ -402,17 +404,71 @@ def _run_store_concern_results(args: dict) -> str:
     return call_with_retry(store_product_concern_scores, data)
 
 
-def concern_agent_tools(tool_log, product_id, synergy):
-    from precompute.flow1.concern_validate import concern_store_precheck
+def _concern_calc_entry(raw) -> dict:
+    return {
+        "name": "calculate_concern_scores",
+        "result": raw,
+        "ok": True,
+    }
+
+
+def concern_agent_tools(tool_log, product_id, synergy, concern_data=None):
+    from precompute.flow1.concern_validate import (
+        concern_store_precheck,
+        correct_concern_store_values,
+        last_successful,
+        parse_calculate_concern_rows,
+    )
 
     def store(args: dict) -> str:
+        from precompute.flow1.name_reviewer import review_concern_store_data
+
         data = args["data"]
         if not isinstance(data, str):
             raise ToolBlock("Required parameter 'data' must be a string")
-        blocked = concern_store_precheck(data, tool_log, product_id, synergy)
+        data = review_concern_store_data(data)
+        calc_entry = last_successful(tool_log, "calculate_concern_scores")
+        calc_rows = (
+            parse_calculate_concern_rows(calc_entry.get("result"))
+            if calc_entry is not None
+            else None
+        )
+        if calc_rows is None:
+            raw = call_with_retry(calculate_product_concern_scores, product_id)
+            calc_rows = parse_calculate_concern_rows(raw)
+            calc_entry = _concern_calc_entry(raw)
+        if calc_rows is None:
+            raise ToolBlock(
+                "ERROR: call calculate_concern_scores successfully before storing."
+            )
+        data, traces, added_keys = correct_concern_store_values(
+            data, calc_rows, product_id, synergy
+        )
+        for line in traces:
+            with trace_step("concern_correction") as fields:
+                fields["debug_output"] = line
+                if "missing from agent output" in line:
+                    fields["warnings"] = [line]
+        blocked = concern_store_precheck(
+            data,
+            tool_log,
+            product_id,
+            synergy,
+            concern_data,
+            calc_entry=calc_entry,
+            skip_keys=added_keys,
+        )
         if blocked:
             raise ToolBlock(blocked)
-        return call_with_retry(store_product_concern_scores, data)
+        saved = call_with_retry(store_product_concern_scores, data)
+        if not traces:
+            return saved
+        note = "corrected: " + "; ".join(
+            line.removeprefix("concern_correction: ") for line in traces
+        )
+        if saved is None or saved == "":
+            return note
+        return f"{saved}\n{note}"
 
     return (
         AgentTool(
@@ -471,7 +527,11 @@ def run_concern_agent(
         user,
         "gpt-5.4-mini",
         600,
-        list(concern_agent_tools(tool_log, node22["product_id"], synergy)),
+        list(
+            concern_agent_tools(
+                tool_log, node22["product_id"], synergy, node23
+            )
+        ),
         max_completion_tokens=32768,
         tool_log=tool_log,
         extra_user=extra_user,
@@ -578,6 +638,8 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
         return raw
 
     def run_store(args: dict) -> str:
+        from precompute.flow1.safety_validate import safety_store_precheck
+
         calc_result = state["calc_result"]
         if not isinstance(calc_result, dict):
             raise ToolBlock(_STORE_BEFORE_CALCULATE_ERROR)
@@ -589,8 +651,16 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
                 "ERROR: calculate_and_store_safety_flags result is missing "
                 f"fields: {missing}"
             )
+        from precompute.flow1.name_reviewer import review_safety_args
+
+        reviewed = review_safety_args(args)
+        blocked = safety_store_precheck(
+            reviewed, calc_result, interaction_result, product_id
+        )
+        if blocked:
+            raise ToolBlock(blocked)
         payload = _build_safety_store_payload(
-            product_id, interaction_result, calc_result, args
+            product_id, interaction_result, calc_result, reviewed
         )
         return call_with_retry(store_product_safety_flags, payload)
 
@@ -680,7 +750,9 @@ def formulation_agent_tools(tool_log, node22):
     from precompute.flow1.formulation_validate import formulation_store_precheck
 
     def store(args: dict) -> str:
-        data = args["data"]
+        from precompute.flow1.name_reviewer import review_formulation_store_data
+
+        data = review_formulation_store_data(args["data"])
         blocked = formulation_store_precheck(data, tool_log, node22)
         if blocked:
             raise ToolBlock(blocked)
@@ -805,107 +877,119 @@ def _run_save_llm_interaction(args: dict) -> str:
     )
 
 
-INTERACTION_BUILDER_AGENT_TOOLS = (
-    AgentTool(
-        name="get_active_ingredients_for_interactions",
-        description=(
-            "Gets only active ingredients for this product that need "
-            "interaction checking. Returns list of ingredient names. "
-            "Input: product_id (integer)"
+def interaction_builder_agent_tools(tool_log):
+    from precompute.flow1.interaction_validate import interaction_save_precheck
+
+    def save(args: dict) -> str:
+        blocked = interaction_save_precheck(args, tool_log)
+        if blocked:
+            raise ToolBlock(blocked)
+        return _run_save_llm_interaction(args)
+
+    return (
+        AgentTool(
+            name="get_active_ingredients_for_interactions",
+            description=(
+                "Gets only active ingredients for this product that need "
+                "interaction checking. Returns list of ingredient names. "
+                "Input: product_id (integer)"
+            ),
+            parameters=(
+                {
+                    "name": "product_id",
+                    "type": "number",
+                    "description": "0",
+                },
+            ),
+            run=_run_get_active_ingredients_for_interactions,
         ),
-        parameters=(
-            {
-                "name": "product_id",
-                "type": "number",
-                "description": "0",
-            },
+        AgentTool(
+            name="get_predefined_interactions",
+            description=(
+                "Checks predefined ingredient interactions database for known "
+                "interaction pairs found in this product. Call this BEFORE "
+                "searching web. Returns all known pairs with interaction_type, "
+                "interaction_severity and reason. Input: product_id (integer)"
+            ),
+            parameters=(
+                {
+                    "name": "product_id",
+                    "type": "number",
+                    "description": "0",
+                },
+            ),
+            run=_run_get_predefined_interactions_for_interaction_builder,
         ),
-        run=_run_get_active_ingredients_for_interactions,
-    ),
-    AgentTool(
-        name="get_predefined_interactions",
-        description=(
-            "Checks predefined ingredient interactions database for known "
-            "interaction pairs found in this product. Call this BEFORE "
-            "searching web. Returns all known pairs with interaction_type, "
-            "interaction_severity and reason. Input: product_id (integer)"
+        AgentTool(
+            name="get_ingredient_irritation_flags",
+            description=(
+                "Gets which of this product's ingredients have high or medium "
+                "irritation potential, sourced from the ingredient database. "
+                "Call this before building irritation_synergies or "
+                "interaction_synergies in Step 5. Returns list of "
+                "ingredient_name and irritation_potential. Input: product_id "
+                "(integer)"
+            ),
+            parameters=(
+                {
+                    "name": "product_id",
+                    "type": "number",
+                    "description": "0",
+                },
+            ),
+            run=_run_get_ingredient_irritation_flags,
         ),
-        parameters=(
-            {
-                "name": "product_id",
-                "type": "number",
-                "description": "0",
-            },
+        AgentTool(
+            name="save_llm_interaction",
+            description=(
+                "Saves a newly LLM-classified ingredient interaction pair to "
+                "the predefined interactions database, so future runs can "
+                "reuse it instead of re-classifying. Call this once for each "
+                "pair you classified yourself (source = \"llm\") that was NOT "
+                "already found via get_predefined_interactions. Do not call "
+                "this for pairs that came from the database already. Input: "
+                "ingredient_a (string), ingredient_b (string), raw_type "
+                "(string), severity (string, synergistic only), reason "
+                "(string), is_irritation_related (boolean, synergistic only)."
+            ),
+            parameters=(
+                {
+                    "name": "ingredient_a",
+                    "type": "string",
+                    "description": "",
+                },
+                {
+                    "name": "ingredient_b",
+                    "type": "string",
+                    "description": "",
+                },
+                {
+                    "name": "raw_type",
+                    "type": "string",
+                    "description": "",
+                },
+                {
+                    "name": "severity",
+                    "type": ["string", "null"],
+                    "description": "",
+                },
+                {
+                    "name": "reason",
+                    "type": "string",
+                    "description": "",
+                },
+                {
+                    "name": "is_irritation_related",
+                    "type": ["boolean", "null"],
+                    "description": "",
+                },
+            ),
+            run=save,
         ),
-        run=_run_get_predefined_interactions_for_interaction_builder,
-    ),
-    AgentTool(
-        name="get_ingredient_irritation_flags",
-        description=(
-            "Gets which of this product's ingredients have high or medium "
-            "irritation potential, sourced from the ingredient database. "
-            "Call this before building irritation_synergies or "
-            "interaction_synergies in Step 5. Returns list of "
-            "ingredient_name and irritation_potential. Input: product_id "
-            "(integer)"
-        ),
-        parameters=(
-            {
-                "name": "product_id",
-                "type": "number",
-                "description": "0",
-            },
-        ),
-        run=_run_get_ingredient_irritation_flags,
-    ),
-    AgentTool(
-        name="save_llm_interaction",
-        description=(
-            "Saves a newly LLM-classified ingredient interaction pair to "
-            "the predefined interactions database, so future runs can "
-            "reuse it instead of re-classifying. Call this once for each "
-            "pair you classified yourself (source = \"llm\") that was NOT "
-            "already found via get_predefined_interactions. Do not call "
-            "this for pairs that came from the database already. Input: "
-            "ingredient_a (string), ingredient_b (string), raw_type "
-            "(string), severity (string, synergistic only), reason "
-            "(string), is_irritation_related (boolean, synergistic only)."
-        ),
-        parameters=(
-            {
-                "name": "ingredient_a",
-                "type": "string",
-                "description": "",
-            },
-            {
-                "name": "ingredient_b",
-                "type": "string",
-                "description": "",
-            },
-            {
-                "name": "raw_type",
-                "type": "string",
-                "description": "",
-            },
-            {
-                "name": "severity",
-                "type": ["string", "null"],
-                "description": "",
-            },
-            {
-                "name": "reason",
-                "type": "string",
-                "description": "",
-            },
-            {
-                "name": "is_irritation_related",
-                "type": ["boolean", "null"],
-                "description": "",
-            },
-        ),
-        run=_run_save_llm_interaction,
-    ),
-)
+    )
+
+
+INTERACTION_BUILDER_AGENT_TOOLS = interaction_builder_agent_tools([])
 
 
 def run_interaction_builder_agent(
@@ -918,15 +1002,17 @@ def run_interaction_builder_agent(
     )
 
     record_prompt_values({"product_id": product_id})
+    tool_log = []
     return run_tools_agent_responses(
         strip_leading_equals(INTERACTION_BUILDER_AGENT_SYSTEM),
         render_interaction_builder_agent_user(product_id),
         model,
         timeout,
-        list(INTERACTION_BUILDER_AGENT_TOOLS),
+        list(interaction_builder_agent_tools(tool_log)),
         max_output_tokens=32768,
         max_calls=50,
         extra_user=extra_user,
+        tool_log=tool_log,
     )
 
 

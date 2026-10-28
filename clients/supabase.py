@@ -115,6 +115,61 @@ def format_canonical_name_in_filter(names: list[str]) -> str:
     return "in.(" + ",".join(quoted) + ")"
 
 
+CANONICAL_NAME_PAGE_SIZE = 1000
+
+
+@traced("supabase.get_canonical_names_page")
+def get_canonical_names_page(offset: int, limit: int = CANONICAL_NAME_PAGE_SIZE) -> list[str]:
+    """Paged GET /ingredients?select=canonical_name&order=canonical_name.asc."""
+    _, key = require_supabase_config()
+    start = max(int(offset), 0)
+    size = max(int(limit), 1)
+    end = start + size - 1
+    headers = _headers(key)
+    headers["Range"] = f"{start}-{end}"
+    endpoint = _rest("ingredients?select=canonical_name&order=canonical_name.asc")
+    response = _capture(httpx.get(endpoint, headers=headers, timeout=30.0))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"Unexpected canonical_name page response: {payload!r}"
+        )
+    names = []
+    for row in payload:
+        if isinstance(row, dict) and row.get("canonical_name"):
+            names.append(row["canonical_name"])
+    return names
+
+
+@traced("supabase.get_ingredients_catalog_page")
+def get_ingredients_catalog_page(
+    offset: int, limit: int = CANONICAL_NAME_PAGE_SIZE
+) -> list[dict]:
+    """Paged GET /ingredients?select=id,canonical_name,function_categories&order=id.asc."""
+    _, key = require_supabase_config()
+    start = max(int(offset), 0)
+    size = max(int(limit), 1)
+    end = start + size - 1
+    headers = _headers(key)
+    headers["Range"] = f"{start}-{end}"
+    endpoint = _rest(
+        "ingredients?select=id,canonical_name,function_categories&order=id.asc"
+    )
+    response = _capture(httpx.get(endpoint, headers=headers, timeout=30.0))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"Unexpected ingredients catalog page response: {payload!r}"
+        )
+    rows = []
+    for row in payload:
+        if isinstance(row, dict) and row.get("canonical_name"):
+            rows.append(row)
+    return rows
+
+
 @traced("supabase.get_ingredients_by_canonical_names")
 def get_ingredients_by_canonical_names(names: list[str]) -> list[dict]:
     """GET /ingredients?select=canonical_name&canonical_name=in.(...) via httpx params."""

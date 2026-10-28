@@ -7,6 +7,11 @@ from ingestion.enrichment import (
 )
 from ingestion.extract import extract_ingredients
 from ingestion.handoff import post_loop_handoff
+from ingestion.inci_catalog import (
+    disable_inci_catalog_autoload,
+    enable_inci_catalog_autoload,
+    reset_inci_ingredient_catalog,
+)
 from ingestion.key_ingredients import mark_key_ingredients
 from ingestion.llm_inci import llm_inci_normalizer
 from ingestion.match import match_and_upsert_ingredients
@@ -43,9 +48,14 @@ def _ensure_not_processed(items: list) -> None:
 
 def run_subflow1() -> dict:
     """Sub-flow 1: catalog loop (nodes 2–34) then post-loop handoff (nodes 35–36)."""
-    with start_run():
-        with trace_step("run_subflow1"):
-            return _run_subflow1_body()
+    reset_inci_ingredient_catalog()
+    enable_inci_catalog_autoload()
+    try:
+        with start_run():
+            with trace_step("run_subflow1"):
+                return _run_subflow1_body()
+    finally:
+        disable_inci_catalog_autoload()
 
 
 def _process_one_url(url: str, saved_product_ids: list, step: list) -> dict:

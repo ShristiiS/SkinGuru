@@ -50,23 +50,23 @@ def _js_template_value(value) -> str:
     return str(value)
 
 
-SYNERGY_REASONING_SYSTEM_EXPORT = "=" + 'You are a cosmetic science expert analyzing ingredient synergies in skincare formulations.\n\nFor each concern, identify ALL possible synergistic ingredient combinations. Then pick only the STRONGEST one per concern.\n\nRate the winning synergy per concern as:\n- Strong: well-documented compounding effect = 0.166\n- Moderate: meaningful complementary effect = 0.10\n- Weak: minor supportive interaction = 0.05\n- None: no meaningful synergy found = 0\n\nThe reason must be mechanistically specific — name the exact biological pathway or interaction (e.g. "Retinol accelerates cell turnover via RAR receptor activation while Retinyl Propionate acts as a slow-release retinol precursor, extending the renewal effect"). Never use vague language like "both enhance skin renewal".\n\nReturn ONLY valid JSON, no explanation, no markdown:\n{\n  "synergies": [\n    {\n      "concern": "concern_key",\n      "pairs": ["INGREDIENT A", "INGREDIENT B"],\n      "strength": "Strong|Moderate|Weak|None",\n      "reason": "mechanistically specific one line explanation",\n      "score": 0.166\n    }\n  ],\n  "total_synergy_score": 0.0\n}\n\nRules:\n- One entry per concern only — the strongest synergy found\n- total_synergy_score = sum of all concern scores, capped at 0.5\n- If no synergy for a concern, still include it with strength None and score 0'
+SYNERGY_REASONING_SYSTEM_EXPORT = "=" + 'You are a cosmetic science expert analyzing ingredient synergies in skincare formulations.\n\nFor each concern, identify ALL possible synergistic ingredient combinations. Then pick only the STRONGEST one per concern.\n\nRate the winning synergy per concern as:\n- Strong: well-documented compounding effect = 0.166\n- Moderate: meaningful complementary effect = 0.10\n- Weak: minor supportive interaction = 0.05\n- None: no meaningful synergy found = 0\n\nThe reason must be mechanistically specific — name the exact biological pathway or interaction (e.g. "Retinol accelerates cell turnover via RAR receptor activation while Retinyl Propionate acts as a slow-release retinol precursor, extending the renewal effect"). Never use vague language like "both enhance skin renewal".\n\nReturn ONLY valid JSON, no explanation, no markdown:\n{\n  "synergies": [\n    {\n      "concern": "concern_key",\n      "pairs": ["INGREDIENT A", "INGREDIENT B"],\n      "strength": "Strong|Moderate|Weak|None",\n      "reason": "mechanistically specific one line explanation",\n      "score": 0.166\n    }\n  ],\n  "total_synergy_score": 0.0\n}\n\nRules:\n- One entry per concern only — the strongest synergy found\n- total_synergy_score = sum of all concern scores, capped at 0.5\n- If no synergy for a concern, still include it with strength None and score 0\n- For each concern, pick pairs ONLY from the ingredients listed under that concern. Never use an ingredient that is not listed for that concern.\n- If a concern has fewer than 2 listed ingredients, return pairs [], strength None, score 0'
 SYNERGY_REASONING_SYSTEM = strip_leading_equals(SYNERGY_REASONING_SYSTEM_EXPORT)
-SYNERGY_REASONING_USER_TEMPLATE = 'User concerns: {{ JSON.stringify($json.concern_keys) }}\nActive ingredients with concentrations: {{ JSON.stringify($json.concern_tiers) }}\nConcentrations: {{ JSON.stringify($json.concentrations) }}'
+SYNERGY_REASONING_USER_TEMPLATE = 'User concerns: {{ JSON.stringify($json.concern_keys) }}\nIngredients listed per concern (use ONLY these): {{ JSON.stringify($json.synergy_ingredients) }}'
 
 _SYNERGY_KEYS = "{{ JSON.stringify($json.concern_keys) }}"
-_SYNERGY_TIERS = "{{ JSON.stringify($json.concern_tiers) }}"
-_SYNERGY_CONC = "{{ JSON.stringify($json.concentrations) }}"
+_SYNERGY_LISTED = "{{ JSON.stringify($json.synergy_ingredients) }}"
 
 
 def render_synergy_reasoning_user(concern_data: dict) -> str:
+    from precompute.flow1.synergy_validate import build_synergy_concern_ingredients
+
     data = concern_data if isinstance(concern_data, dict) else {}
+    listed = build_synergy_concern_ingredients(data)
     return (
         SYNERGY_REASONING_USER_TEMPLATE.replace(
             _SYNERGY_KEYS, compact_json(data.get("concern_keys"))
-        )
-        .replace(_SYNERGY_TIERS, compact_json(data.get("concern_tiers")))
-        .replace(_SYNERGY_CONC, compact_json(data.get("concentrations")))
+        ).replace(_SYNERGY_LISTED, compact_json(listed))
     )
 
 

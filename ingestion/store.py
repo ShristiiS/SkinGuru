@@ -25,6 +25,24 @@ def _display_order_sort_key(ing: dict):
     return (0, order)
 
 
+def _match_name(ing: dict) -> str:
+    name = ing.get("ingredient_name")
+    if not isinstance(name, str) or not name.strip():
+        name = ing.get("normalized_name") or ""
+    return str(name).upper().strip()
+
+
+def _is_aqua(ing: dict) -> bool:
+    return _match_name(ing) == "AQUA"
+
+
+def _water_last_should_fire(ingredients: list[dict]) -> bool:
+    if not ingredients:
+        return False
+    ordered = sorted(ingredients, key=_display_order_sort_key)
+    return _is_aqua(ordered[-1]) and not _is_aqua(ordered[0])
+
+
 def _dedupe_note(kept: dict, skipped: list[dict]) -> str:
     orders = ", ".join(str(row.get("display_order")) for row in skipped)
     labels = ", ".join(
@@ -36,7 +54,7 @@ def _dedupe_note(kept: dict, skipped: list[dict]) -> str:
     )
 
 
-def dedupe_product_ingredients(ingredients: list[dict]) -> list[dict]:
+def _collapse_repeats(ingredients: list[dict]) -> tuple[list[dict], list[str]]:
     """Keep the lowest display_order per (product_id, ingredient_id). Deliberate change from n8n."""
     groups: dict = {}
     for ing in ingredients:
@@ -71,7 +89,43 @@ def dedupe_product_ingredients(ingredients: list[dict]) -> list[dict]:
         }
         result.append(merged)
         notes.append(_dedupe_note(kept, skipped))
+    return result, notes
 
+
+def _apply_water_last(ingredients: list[dict]) -> list[dict]:
+    ordered = sorted(ingredients, key=_display_order_sort_key)
+    last_pos = ordered[-1].get("display_order")
+    aqua_rows = [row for row in ordered if _is_aqua(row)]
+    aqua_positions = [row.get("display_order") for row in aqua_rows]
+    rest = [row for row in ordered if not _is_aqua(row)]
+    collapsed, notes = _collapse_repeats(rest)
+    aqua_kept = min(aqua_rows, key=_display_order_sort_key)
+    aqua_out = {
+        **aqua_kept,
+        "is_key_ingredient": any(
+            row.get("is_key_ingredient") is True for row in aqua_rows
+        ),
+        "display_order": 1,
+    }
+    result = [aqua_out]
+    for index, row in enumerate(collapsed, start=2):
+        result.append({**row, "display_order": index})
+    note = (
+        f"AQUA was last (position {last_pos}) and not first: moved to 1; "
+        f"removed AQUA at {', '.join(str(pos) for pos in aqua_positions)}; "
+        f"renumbered 1-{len(result)}"
+    )
+    with trace_step("dedupe_product_ingredients") as fields:
+        fields["debug_input"] = {"count": len(ingredients)}
+        fields["debug_output"] = [note, *notes]
+    return result
+
+
+def dedupe_product_ingredients(ingredients: list[dict], *, water_last=False) -> list[dict]:
+    """Keep the lowest display_order per (product_id, ingredient_id). Deliberate change from n8n."""
+    if water_last and _water_last_should_fire(ingredients):
+        return _apply_water_last(ingredients)
+    result, notes = _collapse_repeats(ingredients)
     with trace_step("dedupe_product_ingredients") as fields:
         fields["debug_input"] = {"count": len(ingredients)}
         fields["debug_output"] = notes
@@ -115,7 +169,9 @@ def store_product_ingredients(
     ingredients: list[dict], written: ProductWriteResult
 ) -> tuple[list[dict], list[dict]]:
     """Node 25 store + node 28 re-GET. Missing matched ids: re-store those rows, max 3 runs."""
-    ingredients = dedupe_product_ingredients(ingredients)
+    ingredients = dedupe_product_ingredients(
+        ingredients, water_last=written.action == "inserted"
+    )
     sent_matched = [ing for ing in ingredients if ing.get("matched") is True]
     pending = list(ingredients)
     stored: list[dict] = []

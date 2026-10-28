@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 
+from precompute.flow1.claims_check import check_llm_interaction_reason
 from tracing import trace_step
 from tracing.debug import to_jsonable
 
@@ -304,6 +305,29 @@ def _predefined_pairs(raw) -> list:
     return pairs
 
 
+def interaction_save_precheck(args, tool_log):
+    payload = args if isinstance(args, dict) else {}
+    active_names = set()
+    for entry in reversed(_entries(tool_log, "get_active_ingredients_for_interactions")):
+        if entry.get("ok") is True:
+            active_names = _name_set(entry.get("result"))
+            break
+    problems = check_llm_interaction_reason(
+        payload.get("reason"),
+        payload.get("ingredient_a"),
+        payload.get("ingredient_b"),
+        active_names,
+        product_names=active_names,
+        data=payload,
+    )
+    if not problems:
+        return None
+    return (
+        "ERROR: not saved. Fix these and call save_llm_interaction again:\n"
+        + "\n".join(problems)
+    )
+
+
 def validate_interaction_builder_checks(parsed: dict, result) -> None:
     """D.8.1–7. Existing JSON/array checks stay in validate_interaction_result."""
     tool_log = getattr(result, "tool_log", None) or []
@@ -363,6 +387,19 @@ def validate_interaction_builder_checks(parsed: dict, result) -> None:
             raise ValueError(f'source "llm" pair {a} + {b} was not saved')
 
     active_names = _name_set(active_entries[-1].get("result"))
+    for pair in parsed.get("interactions") or []:
+        if not isinstance(pair, dict) or pair.get("source") != "llm":
+            continue
+        claims = check_llm_interaction_reason(
+            pair.get("reason"),
+            pair.get("ingredient_a"),
+            pair.get("ingredient_b"),
+            active_names,
+            product_names=active_names,
+            data=pair,
+        )
+        if claims:
+            raise ValueError(claims[0])
     for field in _OUTPUT_ARRAYS:
         rows = parsed.get(field) or []
         if not isinstance(rows, list):

@@ -35,10 +35,13 @@ from precompute.flow1.prompts import (
     strip_leading_equals,
 )
 from precompute.flow1.run_until_ok import AGENT_MAX_RUNS, run_until_ok
+from precompute.concentration.helpers import compact_json
 from precompute.flow1.synergy_validate import (
     SYNERGY_SCHEMA_NAME,
+    build_synergy_concern_ingredients,
     build_synergy_schema,
     collect_synergy_problems,
+    reset_synergy_concern_list_failures,
     synergy_feedback_extra,
     validate_synergy_reply,
 )
@@ -139,19 +142,26 @@ def get_concern_data(product_id):
 def synergy_reasoning(concern_data) -> str:
     """Node 24 — Synergy Reasoning. gpt-4o-mini, reply kept as-is."""
     data = concern_data if isinstance(concern_data, dict) else {}
+    listed = build_synergy_concern_ingredients(data)
     record_prompt_values(
         {
             "concern_keys": data.get("concern_keys"),
-            "concern_tiers": data.get("concern_tiers"),
-            "concentrations": data.get("concentrations"),
+            "synergy_ingredients": listed,
         }
     )
     concern_keys = data.get("concern_keys") or []
     system = strip_leading_equals(SYNERGY_REASONING_SYSTEM_EXPORT)
     user = render_synergy_reasoning_user(concern_data)
+    from precompute.flow1.claims_check import product_names_from_context
+
+    product_names = product_names_from_context()
+    last_text = {"text": None}
 
     def check(text: str):
-        _parsed, problems = collect_synergy_problems(text, concern_keys)
+        last_text["text"] = text
+        _parsed, problems = collect_synergy_problems(
+            text, concern_keys, product_names, data, listed
+        )
         return problems
 
     try:
@@ -172,13 +182,47 @@ def synergy_reasoning(concern_data) -> str:
                 "synergy_reasoning", run, "\n".join(problems)
             ),
         )
+        text = result.text
     except ValueError as exc:
-        record_step(
-            "synergy_reasoning",
-            "FAILED",
-            f"run {AGENT_MAX_RUNS} of {AGENT_MAX_RUNS}: {exc}",
+        parsed, leftover = (None, [str(exc)])
+        if last_text["text"]:
+            parsed, leftover = collect_synergy_problems(
+                last_text["text"],
+                concern_keys,
+                product_names,
+                data,
+                listed,
+            )
+        resets = (
+            reset_synergy_concern_list_failures(parsed, listed)
+            if parsed is not None
+            else []
         )
-        raise
+        if parsed is not None and resets:
+            _, leftover = collect_synergy_problems(
+                compact_json(parsed),
+                concern_keys,
+                product_names,
+                data,
+                listed,
+            )
+            if not leftover:
+                text = compact_json(parsed)
+            else:
+                record_step(
+                    "synergy_reasoning",
+                    "FAILED",
+                    f"run {AGENT_MAX_RUNS} of {AGENT_MAX_RUNS}: "
+                    + "\n".join(leftover),
+                )
+                raise ValueError("\n".join(leftover)) from exc
+        else:
+            record_step(
+                "synergy_reasoning",
+                "FAILED",
+                f"run {AGENT_MAX_RUNS} of {AGENT_MAX_RUNS}: {exc}",
+            )
+            raise
     except Exception as exc:
         record_rerun("synergy_reasoning", 1, str(exc))
         record_step(
@@ -187,15 +231,18 @@ def synergy_reasoning(concern_data) -> str:
             f"run 1 of {AGENT_MAX_RUNS}: {exc}",
         )
         raise
+    else:
+        parsed, problems = collect_synergy_problems(
+            text, concern_keys, product_names, data, listed
+        )
+        if problems:
+            raise ValueError("\n".join(problems))
 
-    parsed, problems = collect_synergy_problems(result.text, concern_keys)
-    if problems:
-        raise ValueError("\n".join(problems))
     record = current_product_record()
     if record is not None:
         record.synergy_parsed = parsed
     record_step("synergy_reasoning", "OK")
-    return result.text
+    return text
 
 
 @traced("concern_agent")

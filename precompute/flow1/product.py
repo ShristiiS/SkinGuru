@@ -145,6 +145,12 @@ def process_one_product(product_id) -> dict:
                 return {"product_id": product_id, "already_computed": True}
             try:
                 node4 = get_product_ingredients(product_id)
+                if record is not None:
+                    record.ingredient_names = [
+                        item.get("ingredient_name")
+                        for item in node4.get("ingredients") or []
+                        if isinstance(item, dict) and item.get("ingredient_name")
+                    ]
                 record_step("ingredients", "OK")
             except Exception as exc:
                 _fail_early("ingredients", exc)

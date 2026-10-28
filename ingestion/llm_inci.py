@@ -4,10 +4,15 @@ import string
 
 from clients.supabase import get_ingredients_by_canonical_names
 from config import OPENAI_TIMEOUT_SECONDS
+from ingestion.inci_catalog import (
+    ensure_inci_ingredient_catalog,
+    near_match_key,
+    pick_near_match,
+)
 from ingestion.product_record import record_inci_dropped, record_rerun, record_warning
 from precompute.call_retry import call_with_retry
-from precompute.llm_call import format_llm_feedback, run_llm_call
-from tracing import traced
+from precompute.llm_call import QUALITY_MAX_RUNS, format_llm_feedback, run_llm_call
+from tracing import trace_step, traced
 from tracing.step import record_warnings
 
 # Verbatim from the n8n node / audit appendix. Do not edit.
@@ -96,6 +101,10 @@ _RULE8_WORDS = (
 _COMBINED_SPLIT = re.compile(r" AND | & | \+ ", re.I)
 CANONICAL_LOOKUP_BATCH = 50
 INCI_LOOKUP_WARNING = "canonical_name lookup failed"
+INCI_TABLE_UNKNOWN = (
+    " is not in the ingredient table. Give the official INCI name if one "
+    "exists. If it is a genuinely new ingredient, repeat the same name exactly."
+)
 
 
 def _input_compare_key(value) -> str:
@@ -219,6 +228,83 @@ class CanonicalNameLookup:
         return self.known
 
 
+class InciTableResolver:
+    """After A–F: exact/near-match table names, or ask once about unknowns."""
+
+    def __init__(self):
+        self.asked = set()
+        self.runs = 0
+        self.traces: list[str] = []
+
+    def _lookup(self, name: str, exact, near):
+        if name in exact:
+            return "exact", name
+        matches = near.get(near_match_key(name)) or []
+        if not matches:
+            return "unknown", name
+        picked = pick_near_match(matches)
+        return "near", picked["canonical_name"]
+
+    def _walk_output_names(self, parsed):
+        names = []
+        if not isinstance(parsed, list):
+            return names
+        for entry in parsed:
+            if not isinstance(entry, dict):
+                continue
+            output = entry.get("output")
+            if not _output_is_list_of_strings(output):
+                continue
+            for name in output:
+                names.append((entry, name))
+        return names
+
+    def check(self, parsed) -> list[str]:
+        self.runs += 1
+        catalog = ensure_inci_ingredient_catalog()
+        if catalog is None:
+            return []
+        exact, near = catalog
+        problems = []
+        for _entry, name in self._walk_output_names(parsed):
+            kind, _resolved = self._lookup(name, exact, near)
+            if kind != "unknown":
+                continue
+            if name in self.asked:
+                continue
+            self.asked.add(name)
+            problems.append(f"{name}{INCI_TABLE_UNKNOWN}")
+        if problems and self.runs >= QUALITY_MAX_RUNS:
+            return []
+        return problems
+
+    def apply(self, parsed) -> None:
+        catalog = ensure_inci_ingredient_catalog()
+        if catalog is None or not isinstance(parsed, list):
+            return
+        exact, near = catalog
+        traces = []
+        for entry in parsed:
+            if not isinstance(entry, dict):
+                continue
+            output = entry.get("output")
+            if not _output_is_list_of_strings(output):
+                continue
+            resolved = []
+            for name in output:
+                kind, table_name = self._lookup(name, exact, near)
+                if kind == "near" and table_name != name:
+                    traces.append(f"{name} → {table_name} (near-match)")
+                    resolved.append(table_name)
+                else:
+                    resolved.append(name)
+            entry["output"] = resolved
+        if traces:
+            self.traces.extend(traces)
+            with trace_step("inci_catalog_near_match") as fields:
+                fields["debug_output"] = traces
+
+
 def collect_inci_problems(
     content: str, ingredient_names: list[str], canonical_names=None
 ):
@@ -267,17 +353,14 @@ def collect_inci_problems(
                     )
         if canonical_names is not None:
             original_key = line.upper().strip()
-            if original_key in canonical_names:
-                if not output:
-                    problems.append(
-                        f"line {line_no}: '{line}' is a real ingredient. "
-                        "Do not drop it."
-                    )
-                elif output != [original_key]:
-                    problems.append(
-                        f"line {line_no}: '{line}' is already a correct INCI "
-                        "name. Return it exactly as is."
-                    )
+            if original_key in canonical_names and output != [original_key]:
+                note = (
+                    f"line {line_no}: '{line}' is an exact table name; "
+                    f"AI wrote {output}, used {original_key}"
+                )
+                entry["output"] = [original_key]
+                with trace_step("inci_rule_f") as fields:
+                    fields["debug_output"] = note
     return parsed, problems
 
 
@@ -328,17 +411,23 @@ def _rows_from_parsed(items: list[dict], parsed: list) -> tuple[list[dict], list
     return rows, dropped
 
 
-def _inci_check(ingredient_names: list[str], lookup: CanonicalNameLookup):
+def _inci_check(
+    ingredient_names: list[str],
+    lookup: CanonicalNameLookup,
+    resolver: InciTableResolver,
+):
     def check(text: str):
         unwrapped = unwrap_inci_reply(text)
         preview = _preview_parsed(unwrapped)
         to_fetch = list(ingredient_names)
         to_fetch.extend(_combined_output_names(preview, ingredient_names))
         canonical = lookup.fetch(to_fetch)
-        _parsed, problems = collect_inci_problems(
+        parsed, problems = collect_inci_problems(
             unwrapped, ingredient_names, canonical_names=canonical
         )
-        return problems
+        if problems:
+            return problems
+        return resolver.check(parsed)
 
     return check
 
@@ -356,6 +445,7 @@ def llm_inci_normalizer(items: list[dict]) -> list[dict]:
     ingredient_names = [item["ingredient_name"] for item in items]
     user_content = "\n".join(ingredient_names)
     lookup = CanonicalNameLookup()
+    resolver = InciTableResolver()
 
     result = run_llm_call(
         api="chat",
@@ -369,7 +459,7 @@ def llm_inci_normalizer(items: list[dict]) -> list[dict]:
         temperature=0,
         schema_name=INCI_SCHEMA_NAME,
         schema=INCI_SCHEMA,
-        check=_inci_check(ingredient_names, lookup),
+        check=_inci_check(ingredient_names, lookup, resolver),
         step="inci_normalizer",
         feedback_extra=inci_feedback_extra(ingredient_names),
         on_quality_failure=lambda run, problems: record_rerun(
@@ -384,6 +474,7 @@ def llm_inci_normalizer(items: list[dict]) -> list[dict]:
     )
     if problems:
         raise ValueError("\n".join(problems))
+    resolver.apply(parsed)
     rows, dropped = _rows_from_parsed(items, parsed)
     if dropped:
         record_inci_dropped(dropped)
