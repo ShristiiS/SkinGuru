@@ -5,10 +5,6 @@ import json
 import re
 
 from precompute.concentration.helpers import compact_json
-from precompute.flow1.claims_check import (
-    check_concern_texts,
-    product_names_from_context,
-)
 from precompute.flow1.value_equal import ingredients_equal
 
 _TEXT_FIELDS = (
@@ -115,45 +111,6 @@ def _synergy_pair_names(value):
 
 def _pair_key(names):
     return frozenset(name.casefold() for name in names)
-
-
-def _strip_surrounding_reason(value: str) -> str:
-    cleaned = value.strip().strip(".").strip()
-    return cleaned.casefold()
-
-
-def _reason_equal(left, right) -> bool:
-    if not isinstance(left, str) or not isinstance(right, str):
-        return False
-    return _strip_surrounding_reason(left) == _strip_surrounding_reason(right)
-
-
-def _name_or_first_word_in(name: str, text_cf: str) -> bool:
-    full = name.strip().casefold()
-    if full and full in text_cf:
-        return True
-    parts = name.strip().split()
-    if not parts:
-        return False
-    first = parts[0].casefold()
-    return bool(first) and first in text_cf
-
-
-def _synergy_reasoning_ok(text, entry) -> bool:
-    if _empty_text(text):
-        return False
-    if not isinstance(entry, dict):
-        return False
-    if entry.get("strength") == "None":
-        return True
-    if _reason_equal(text, entry.get("reason")):
-        return True
-    names = _synergy_pair_names(entry.get("pairs"))
-    if names is not None and len(names) == 2:
-        text_cf = text.casefold()
-        if all(_name_or_first_word_in(name, text_cf) for name in names):
-            return True
-    return False
 
 
 def parse_calculate_concern_rows(raw):
@@ -365,29 +322,16 @@ def collect_concern_store_problems(
                 calc_by_key[row.get("concern_key")] = row
 
     checked_rows = _rows_for_text_checks(rows, calc_by_key, skip_keys)
-    synergy_obj = synergy if isinstance(synergy, dict) else {}
     for row in checked_rows:
         key = row.get("concern_key")
-        entry = _synergy_entry(synergy_obj, key)
         if _empty_text(row.get("synergy_reasoning")):
             problems.append(f"concern {key!r} synergy_reasoning empty")
-        elif not _synergy_reasoning_ok(row.get("synergy_reasoning"), entry):
-            problems.append(f"concern {key!r} synergy_reasoning does not match")
         if _empty_text(row.get("concern_reasoning")):
             problems.append(f"concern {key!r} concern_reasoning empty")
         if _empty_text(row.get("bonus_reasoning")):
             problems.append(f"concern {key!r} bonus_reasoning empty")
         if _empty_text(row.get("full_explanation")):
             problems.append(f"concern {key!r} full_explanation empty")
-    problems.extend(
-        check_concern_texts(
-            checked_rows,
-            calc_by_key,
-            synergy,
-            product_names_from_context(product_id),
-            concern_data,
-        )
-    )
     return problems
 
 

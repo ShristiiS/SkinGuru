@@ -421,12 +421,11 @@ def concern_agent_tools(tool_log, product_id, synergy, concern_data=None):
     )
 
     def store(args: dict) -> str:
-        from precompute.flow1.name_reviewer import review_concern_store_data
+        from precompute.flow1.concern_text_reviewer import review_concern_store_texts
 
         data = args["data"]
         if not isinstance(data, str):
             raise ToolBlock("Required parameter 'data' must be a string")
-        data = review_concern_store_data(data)
         calc_entry = last_successful(tool_log, "calculate_concern_scores")
         calc_rows = (
             parse_calculate_concern_rows(calc_entry.get("result"))
@@ -449,6 +448,7 @@ def concern_agent_tools(tool_log, product_id, synergy, concern_data=None):
                 fields["debug_output"] = line
                 if "missing from agent output" in line:
                     fields["warnings"] = [line]
+        data = review_concern_store_texts(data, synergy)
         blocked = concern_store_precheck(
             data,
             tool_log,
