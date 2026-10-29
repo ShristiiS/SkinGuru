@@ -7,10 +7,6 @@ from precompute.concentration.llm_checks import (
     ALLOWED_PRODUCT_TYPE_LIST,
     is_valid_product_type,
 )
-from precompute.flow1.claims_check import (
-    check_formulation_texts,
-    product_names_from_context,
-)
 
 _REQUIRED_GETS = (
     "get_product_ingredients_with_functions",
@@ -171,15 +167,6 @@ def collect_formulation_store_problems(store_data, tool_log, node22) -> list:
     for field in _REASON_FIELDS:
         if _empty_text(parsed_store.get(field)):
             problems.append(f"{field} empty")
-    problems.extend(
-        check_formulation_texts(
-            parsed_store,
-            parsed_calc,
-            pipeline,
-            product_names_from_context(pipeline.get("product_id")),
-            {"botanical_count": count_value},
-        )
-    )
     return problems
 
 

@@ -778,14 +778,8 @@ def formulation_agent_tools(tool_log, node22):
     )
 
     def store(args: dict) -> str:
-        from precompute.flow1.name_reviewer import review_formulation_store_data
-
-        draft = {field: args.get(field) for field in _FORMULATION_TEXT_FIELDS}
-        reviewed_raw = review_formulation_store_data(
-            json.dumps(draft, ensure_ascii=False)
-        )
-        reviewed = json.loads(reviewed_raw)
-        blocked = formulation_store_precheck(reviewed, tool_log, node22)
+        texts = {field: args.get(field) for field in _FORMULATION_TEXT_FIELDS}
+        blocked = formulation_store_precheck(texts, tool_log, node22)
         if blocked:
             raise ToolBlock(blocked)
         calc_entry = last_successful(tool_log, "calculate_formulation_score")
@@ -793,7 +787,7 @@ def formulation_agent_tools(tool_log, node22):
             calc_entry.get("result"), "calculate_formulation_score result"
         )
         payload = _build_formulation_store_payload(
-            node22, calc_result, reviewed
+            node22, calc_result, texts
         )
         return call_with_retry(store_product_formulation_score, payload)
 

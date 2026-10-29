@@ -45,14 +45,6 @@ CONCERN_TEXT_FIELDS = (
     "synergy_reasoning",
     "full_explanation",
 )
-FORMULATION_TEXT_FIELDS = (
-    "formulation_reasoning",
-    "structural_completeness_reasoning",
-    "preservation_design_reasoning",
-    "stability_engineering_reasoning",
-    "filler_ratio_reasoning",
-    "full_explanation",
-)
 
 NAME_REVIEWER_SCHEMA = {
     "type": "object",
@@ -208,33 +200,6 @@ def review_concern_store_data(store_data, product_names=None):
     if not changed:
         return store_data
     return json.dumps(rows, ensure_ascii=False)
-
-
-def review_formulation_store_data(store_data, product_names=None):
-    if not isinstance(store_data, str):
-        return store_data
-    try:
-        parsed = json.loads(store_data)
-    except Exception:
-        return store_data
-    if not isinstance(parsed, dict):
-        return store_data
-    fields = [
-        (field, parsed[field] if isinstance(parsed.get(field), str) else "")
-        for field in FORMULATION_TEXT_FIELDS
-        if field in parsed
-    ]
-    if not fields:
-        return store_data
-    reviewed = review_texts(fields, product_names)
-    changed = False
-    for field in FORMULATION_TEXT_FIELDS:
-        if field in parsed and reviewed.get(field) != parsed.get(field):
-            parsed[field] = reviewed[field]
-            changed = True
-    if not changed:
-        return store_data
-    return json.dumps(parsed, ensure_ascii=False)
 
 
 def _product_names(product_names=None):
