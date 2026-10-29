@@ -778,11 +778,29 @@ def formulation_agent_tools(tool_log, node22):
     )
 
     def store(args: dict) -> str:
-        texts = {field: args.get(field) for field in _FORMULATION_TEXT_FIELDS}
+        from precompute.flow1.formulation_text_reviewer import (
+            review_formulation_texts,
+        )
+
+        def parsed_result(entry):
+            if not isinstance(entry, dict):
+                return None
+            try:
+                return _parse_json(entry.get("result"), "tool result")
+            except ValueError:
+                return None
+
+        calc_entry = last_successful(tool_log, "calculate_formulation_score")
+        count_entry = last_successful(tool_log, "count_botanicals")
+        texts = review_formulation_texts(
+            args,
+            node22,
+            parsed_result(calc_entry),
+            parsed_result(count_entry),
+        )
         blocked = formulation_store_precheck(texts, tool_log, node22)
         if blocked:
             raise ToolBlock(blocked)
-        calc_entry = last_successful(tool_log, "calculate_formulation_score")
         calc_result = _parse_json(
             calc_entry.get("result"), "calculate_formulation_score result"
         )
