@@ -641,6 +641,9 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
         return raw
 
     def run_store(args: dict) -> str:
+        from precompute.flow1.safety_text_reviewer import (
+            review_safety_synergy_texts,
+        )
         from precompute.flow1.safety_validate import safety_store_precheck
 
         calc_result = state["calc_result"]
@@ -654,13 +657,14 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
                 "ERROR: calculate_and_store_safety_flags result is missing "
                 f"fields: {missing}"
             )
+        reviewed = review_safety_synergy_texts(args, interaction_result)
         blocked = safety_store_precheck(
-            args, calc_result, interaction_result, product_id
+            reviewed, calc_result, interaction_result, product_id
         )
         if blocked:
             raise ToolBlock(blocked)
         payload = _build_safety_store_payload(
-            product_id, interaction_result, calc_result, args
+            product_id, interaction_result, calc_result, reviewed
         )
         return call_with_retry(store_product_safety_flags, payload)
 
