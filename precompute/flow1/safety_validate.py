@@ -10,8 +10,6 @@ from precompute.flow1.claims_check import (
 )
 
 _REASON_FIELDS = (
-    "safety_reasoning",
-    "full_explanation",
     "irritation_synergy_reasoning",
     "interaction_synergy_reasoning",
 )

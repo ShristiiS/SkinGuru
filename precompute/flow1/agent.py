@@ -614,8 +614,8 @@ def _build_safety_store_payload(
     payload["interaction_synergy_pairs"] = interaction_result[
         "interaction_synergies"
     ]
-    payload["safety_reasoning"] = args["safety_reasoning"]
-    payload["full_explanation"] = args["full_explanation"]
+    payload["safety_reasoning"] = None
+    payload["full_explanation"] = None
     payload["irritation_synergy_reasoning"] = args[
         "irritation_synergy_reasoning"
     ]
@@ -654,16 +654,13 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
                 "ERROR: calculate_and_store_safety_flags result is missing "
                 f"fields: {missing}"
             )
-        from precompute.flow1.name_reviewer import review_safety_args
-
-        reviewed = review_safety_args(args)
         blocked = safety_store_precheck(
-            reviewed, calc_result, interaction_result, product_id
+            args, calc_result, interaction_result, product_id
         )
         if blocked:
             raise ToolBlock(blocked)
         payload = _build_safety_store_payload(
-            product_id, interaction_result, calc_result, reviewed
+            product_id, interaction_result, calc_result, args
         )
         return call_with_retry(store_product_safety_flags, payload)
 
@@ -692,21 +689,10 @@ def build_safety_agent_tools(product_id, interaction_result) -> list:
             description=(
                 "Stores this product's safety flags. The system adds "
                 "product_id, all calculated flag values and the interaction "
-                "arrays automatically. Input: safety_reasoning (string), "
-                "full_explanation (string), irritation_synergy_reasoning "
+                "arrays automatically. Input: irritation_synergy_reasoning "
                 "(string), interaction_synergy_reasoning (string)"
             ),
             parameters=(
-                {
-                    "name": "safety_reasoning",
-                    "type": "string",
-                    "description": "Step 2 safety_reasoning text",
-                },
-                {
-                    "name": "full_explanation",
-                    "type": "string",
-                    "description": "Step 2 full_explanation text",
-                },
                 {
                     "name": "irritation_synergy_reasoning",
                     "type": "string",

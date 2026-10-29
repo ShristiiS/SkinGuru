@@ -39,12 +39,6 @@ Do NOT change anything else:
 If a text needs no change, return it exactly as given.
 Return every field, in the same order, with its "changes" list ([] if nothing changed)."""
 
-SAFETY_TEXT_FIELDS = (
-    "safety_reasoning",
-    "full_explanation",
-    "irritation_synergy_reasoning",
-    "interaction_synergy_reasoning",
-)
 CONCERN_TEXT_FIELDS = (
     "concern_reasoning",
     "bonus_reasoning",
@@ -178,19 +172,6 @@ def review_texts(fields: list[tuple[str, str]], product_names=None) -> dict[str,
     except Exception as exc:
         _log_failure(exc)
         return originals
-
-
-def review_safety_args(args: dict, product_names=None) -> dict:
-    data = dict(args or {})
-    fields = [
-        (field, data[field] if isinstance(data.get(field), str) else "")
-        for field in SAFETY_TEXT_FIELDS
-    ]
-    reviewed = review_texts(fields, product_names)
-    for field in SAFETY_TEXT_FIELDS:
-        if field in data or field in reviewed:
-            data[field] = reviewed.get(field, data.get(field))
-    return data
 
 
 def review_concern_store_data(store_data, product_names=None):

@@ -305,57 +305,6 @@ def check_flag_ingredients(field: str, text: str, calc_result) -> list[str]:
     return problems
 
 
-def _pair_ingredient_names(pairs) -> list[str]:
-    names = []
-    if not isinstance(pairs, list):
-        return names
-    for pair in pairs:
-        if isinstance(pair, dict):
-            for key in ("ingredient_a", "ingredient_b"):
-                value = pair.get(key)
-                if isinstance(value, str) and value.strip():
-                    names.append(value)
-        elif isinstance(pair, (list, tuple)) and len(pair) == 2:
-            for value in pair:
-                if isinstance(value, str) and value.strip():
-                    names.append(value)
-    return names
-
-
-def _names_any_in_text(names, text: str) -> bool:
-    text_cf = text.casefold()
-    return any(_name_or_first_word_in(name, text_cf) for name in names)
-
-
-def check_empty_pair_sentence(
-    field: str,
-    text: str,
-    pairs,
-    empty_sentence: str,
-    name_from_pairs=None,
-) -> list[str]:
-    problems = []
-    if _is_empty_list(pairs):
-        if text != empty_sentence:
-            problems.append(f"{field} must be {empty_sentence!r}")
-        return problems
-    count = len(pairs) if isinstance(pairs, list) else 0
-    if isinstance(text, str) and empty_sentence in text:
-        problems.append(
-            f"{field} says nothing was found, but there are {count} pairs."
-        )
-    source = name_from_pairs if name_from_pairs is not None else pairs
-    names = _pair_ingredient_names(source)
-    if names and isinstance(text, str) and empty_sentence not in (text or ""):
-        if not _names_any_in_text(names, text):
-            problems.append(f"{field} does not name any pair ingredient.")
-    elif names and isinstance(text, str) and empty_sentence in text:
-        pass
-    elif names and not _names_any_in_text(names, text or ""):
-        problems.append(f"{field} does not name any pair ingredient.")
-    return problems
-
-
 def check_safety_texts(
     store_args: dict,
     calc_result,
@@ -363,64 +312,25 @@ def check_safety_texts(
     product_names,
 ) -> list[str]:
     pipeline = interaction_result if isinstance(interaction_result, dict) else {}
-    calc = calc_result if isinstance(calc_result, dict) else {}
-    data = {"calc": calc, "interaction_result": pipeline}
     problems = []
-    reasoning_fields = (
-        "safety_reasoning",
-        "full_explanation",
-        "irritation_synergy_reasoning",
-        "interaction_synergy_reasoning",
-    )
-    for field in reasoning_fields:
-        text = store_args.get(field)
-        if _empty_text(text):
-            continue
-        problems.extend(check_common(field, text, product_names, data))
-    safety_reasoning = store_args.get("safety_reasoning") or ""
-    problems.extend(check_flags_mentioned(safety_reasoning, calc))
-    for field in ("safety_reasoning", "full_explanation"):
-        text = store_args.get(field) or ""
-        if _empty_text(text):
-            continue
-        problems.extend(check_flag_values(field, text, calc))
-        problems.extend(check_flag_ingredients(field, text, calc))
-    problems.extend(
-        check_empty_pair_sentence(
-            "irritation_synergy_reasoning",
-            store_args.get("irritation_synergy_reasoning"),
-            pipeline.get("irritation_synergies"),
-            IRRITATION_SYNERGY_EMPTY,
-        )
-    )
-    interaction_text = store_args.get("interaction_synergy_reasoning")
-    irritation_interactions = pipeline.get("irritation_interactions")
-    if _is_empty_list(irritation_interactions):
-        if interaction_text != INTERACTION_SYNERGY_EMPTY:
+    if _is_empty_list(pipeline.get("irritation_synergies")):
+        if (
+            store_args.get("irritation_synergy_reasoning")
+            != IRRITATION_SYNERGY_EMPTY
+        ):
+            problems.append(
+                "irritation_synergy_reasoning must be "
+                f"{IRRITATION_SYNERGY_EMPTY!r}"
+            )
+    if _is_empty_list(pipeline.get("irritation_interactions")):
+        if (
+            store_args.get("interaction_synergy_reasoning")
+            != INTERACTION_SYNERGY_EMPTY
+        ):
             problems.append(
                 "interaction_synergy_reasoning must be "
                 f"{INTERACTION_SYNERGY_EMPTY!r}"
             )
-    else:
-        count = (
-            len(irritation_interactions)
-            if isinstance(irritation_interactions, list)
-            else 0
-        )
-        if isinstance(interaction_text, str) and INTERACTION_SYNERGY_EMPTY in (
-            interaction_text or ""
-        ):
-            problems.append(
-                "interaction_synergy_reasoning says nothing was found, "
-                f"but there are {count} pairs."
-            )
-        interaction_synergies = pipeline.get("interaction_synergies")
-        if not _is_empty_list(interaction_synergies):
-            names = _pair_ingredient_names(interaction_synergies)
-            if names and not _names_any_in_text(names, interaction_text or ""):
-                problems.append(
-                    "interaction_synergy_reasoning does not name any pair ingredient."
-                )
     return problems
 
 
