@@ -11,7 +11,6 @@ from precompute.flow1.claims_check import (
     check_formulation_texts,
     product_names_from_context,
 )
-from precompute.flow1.value_equal import values_equal
 
 _REQUIRED_GETS = (
     "get_product_ingredients_with_functions",
@@ -133,21 +132,21 @@ def collect_formulation_store_problems(store_data, tool_log, node22) -> list:
         return problems
 
     pipeline_id = _as_int(pipeline.get("product_id"))
-    if _as_int(parsed_store.get("product_id")) != pipeline_id:
+    if _as_int(calc_args.get("product_id")) != pipeline_id:
         problems.append(
-            f"product_id {parsed_store.get('product_id')}, must be "
+            f"product_id {calc_args.get('product_id')}, must be "
             f"{pipeline.get('product_id')}"
         )
-    stored_type = parsed_store.get("formulation_product_type")
-    if not is_valid_product_type(stored_type):
+    calc_type = calc_args.get("product_type")
+    if not is_valid_product_type(calc_type):
         problems.append(
-            f"formulation_product_type {stored_type}, must be one of "
+            f"formulation_product_type {calc_type}, must be one of "
             + ", ".join(ALLOWED_PRODUCT_TYPE_LIST)
         )
-    if stored_type != pipeline.get("formulation_product_type"):
+    if calc_type != pipeline.get("formulation_product_type"):
         problems.append(
             f"formulation_product_type "
-            f"{stored_type}, must be "
+            f"{calc_type}, must be "
             f"{pipeline.get('formulation_product_type')}"
         )
 
@@ -165,27 +164,9 @@ def collect_formulation_store_problems(store_data, tool_log, node22) -> list:
             parsed_calc = None
 
     if isinstance(parsed_calc, dict):
-        if parsed_store.get("formulation_score") != parsed_calc.get("final_score"):
-            problems.append(
-                f"formulation_score {parsed_store.get('formulation_score')}, "
-                f"must be {parsed_calc.get('final_score')}"
-            )
         for name in _COMPONENTS:
-            component = parsed_calc.get(name)
-            if not isinstance(component, dict):
+            if not isinstance(parsed_calc.get(name), dict):
                 problems.append(f"{name} missing from calculate result")
-                continue
-            score_key = f"{name}_score"
-            ingredients_key = f"{name}_ingredients"
-            if parsed_store.get(score_key) != component.get("score"):
-                problems.append(
-                    f"{score_key} {parsed_store.get(score_key)}, "
-                    f"must be {component.get('score')}"
-                )
-            if not values_equal(parsed_store.get(ingredients_key), component):
-                problems.append(
-                    f"{ingredients_key}, must match calculate {name} component"
-                )
 
     for field in _REASON_FIELDS:
         if _empty_text(parsed_store.get(field)):
@@ -238,7 +219,8 @@ def validate_formulation_agent(result, node22: dict) -> None:
         raise ValueError("hit 10 turns")
 
     store_args = store_entries[-1].get("arguments") or {}
-    store_data = store_args.get("data") if isinstance(store_args, dict) else None
-    problems = collect_formulation_store_problems(store_data, tool_log, node22)
+    if not isinstance(store_args, dict):
+        store_args = {}
+    problems = collect_formulation_store_problems(store_args, tool_log, node22)
     if problems:
         raise ValueError(problems[0])

@@ -739,18 +739,63 @@ def _run_store_formulation_score(args: dict) -> str:
     return call_with_retry(store_product_formulation_score, parsed)
 
 
+_FORMULATION_COMPONENTS = (
+    "structural_completeness",
+    "preservation_design",
+    "stability_engineering",
+    "filler_ratio",
+)
+_FORMULATION_TEXT_FIELDS = (
+    "formulation_reasoning",
+    "structural_completeness_reasoning",
+    "preservation_design_reasoning",
+    "stability_engineering_reasoning",
+    "filler_ratio_reasoning",
+    "full_explanation",
+)
+
+
+def _build_formulation_store_payload(node22, calc_result, texts) -> dict:
+    payload = {
+        "product_id": node22["product_id"],
+        "formulation_product_type": node22["formulation_product_type"],
+        "formulation_score": calc_result["final_score"],
+    }
+    for name in _FORMULATION_COMPONENTS:
+        component = calc_result[name]
+        payload[f"{name}_score"] = component["score"]
+        payload[f"{name}_ingredients"] = component
+    for field in _FORMULATION_TEXT_FIELDS:
+        payload[field] = texts[field]
+    return payload
+
+
 def formulation_agent_tools(tool_log, node22):
-    from precompute.flow1.formulation_validate import formulation_store_precheck
+    from precompute.flow1.formulation_validate import (
+        _parse_json,
+        formulation_store_precheck,
+        last_successful,
+    )
 
     def store(args: dict) -> str:
         from precompute.flow1.name_reviewer import review_formulation_store_data
 
-        data = review_formulation_store_data(args["data"])
-        blocked = formulation_store_precheck(data, tool_log, node22)
+        draft = {field: args.get(field) for field in _FORMULATION_TEXT_FIELDS}
+        reviewed_raw = review_formulation_store_data(
+            json.dumps(draft, ensure_ascii=False)
+        )
+        reviewed = json.loads(reviewed_raw)
+        blocked = formulation_store_precheck(reviewed, tool_log, node22)
         if blocked:
             raise ToolBlock(blocked)
-        parsed = _parse_model_json(data)
-        return call_with_retry(store_product_formulation_score, parsed)
+        calc_entry = last_successful(tool_log, "calculate_formulation_score")
+        calc_result = _parse_json(
+            calc_entry.get("result"), "calculate_formulation_score result"
+        )
+        payload = _build_formulation_store_payload(
+            node22, calc_result, reviewed
+        )
+        return call_with_retry(store_product_formulation_score, payload)
 
     return (
         AgentTool(
@@ -812,16 +857,17 @@ def formulation_agent_tools(tool_log, node22):
         AgentTool(
             name="store_formulation_score",
             description=(
-                "Stores formulation score. Input: data as a valid JSON string. "
-                "IMPORTANT: escape all double quotes inside string values, no "
-                "trailing commas, no comments. Validate JSON before passing."
+                "Stores this product's formulation analysis. The system adds "
+                "product_id, product type, all scores and all component "
+                "objects automatically. Input: the 6 reasoning texts (strings)."
             ),
-            parameters=(
+            parameters=tuple(
                 {
-                    "name": "data",
+                    "name": field,
                     "type": "string",
-                    "description": "{}",
-                },
+                    "description": "",
+                }
+                for field in _FORMULATION_TEXT_FIELDS
             ),
             run=store,
         ),
